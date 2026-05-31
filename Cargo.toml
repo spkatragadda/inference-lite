@@ -1,0 +1,20 @@
+[package]
+name = "inference-lite"
+version = "0.1.0"
+edition = "2024"
+description = "From-scratch GGUF inference + serving engine on candle's quantized kernels"
+
+# Library: forward pass, GGUF parser, and the load-once runtime.
+# Binaries (auto-discovered from src/bin): `inference` (CLI) and `server` (HTTP).
+[lib]
+name = "inference_lite"
+path = "src/lib.rs"
+
+[dependencies]
+candle-core = "0.10.2"
+tokenizers = { version = "0.20", default-features = false, features = ["onig"] }
+anyhow = "1.0.102"
+axum = "0.7"
+tokio = { version = "1.35", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
