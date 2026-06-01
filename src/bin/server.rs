@@ -65,7 +65,7 @@ async fn main() -> anyhow::Result<()> {
     // Optional CLI override of the model path: `cargo run --bin server -- /path/model.gguf`.
     let model_path = std::env::args()
         .nth(1)
-        .unwrap_or_else(|| "/mnt/c/Users/saipk/Downloads/Qwen3-0.6B-Q4_0.gguf".to_string());
+        .unwrap_or_else(|| "./Qwen3-0.6B-Q4_0.gguf".to_string());
 
     println!("Loading GGUF weights into memory: {model_path}");
     let engine = Engine::load(&model_path, &device)?;
