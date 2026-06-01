@@ -9,7 +9,7 @@ use std::io::Write;
 fn main() -> anyhow::Result<()> {
     let device = Device::Cpu;
 
-    let model_path = "./Qwen3-0.6B-Q4_0.gguf"//"/mnt/c/Users/saipk/Downloads/Qwen3-0.6B-Q4_0.gguf";
+    let model_path = "./Qwen3-0.6B-Q4_0.gguf";
     println!("Loading GGUF weights into memory: {model_path}");
     let engine = Engine::load(model_path, &device)?;
     println!("Loaded model (arch: {}).", engine.arch());

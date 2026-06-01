@@ -757,6 +757,7 @@ dependencies = [
  "anyhow",
  "axum",
  "candle-core",
+ "rayon",
  "serde",
  "serde_json",
  "tokenizers 0.20.4",

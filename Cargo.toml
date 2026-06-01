@@ -18,3 +18,7 @@ axum = "0.7"
 tokio = { version = "1.35", features = ["full"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+# Data-parallel attention: candle already pulls rayon in transitively for its
+# matmuls; we depend on it directly to parallelize the fused SDPA kernel over
+# query heads.
+rayon = "1.12"

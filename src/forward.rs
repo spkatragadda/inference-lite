@@ -28,6 +28,7 @@ use std::cell::RefCell;
 use anyhow::{anyhow, bail, Context};
 use candle_core::quantized::{gguf_file, QMatMul};
 use candle_core::{DType, Device, Module, Tensor, D};
+use rayon::prelude::*;
 
 use crate::gguf_parser::{InferenceModel, NamedTensor};
 
@@ -59,6 +60,18 @@ enum QkvProjection {
     },
 }
 
+/// One layer's KV cache: two flat, padded f32 buffers laid out
+/// `[n_kv_heads, max_seq, head_dim]` row-major. The new chunk's K/V is written
+/// in place at the current position (an O(q_len) scatter, no reallocation), and
+/// the attention kernel reads these buffers *directly* with the right strides —
+/// no copy of the prior history out of the cache each decode step. `RefCell`
+/// gives the interior mutability the write needs behind the `&self` forward
+/// pass; reads borrow immutably for the duration of the kernel.
+struct KvLayer {
+    k: RefCell<Vec<f32>>,
+    v: RefCell<Vec<f32>>,
+}
+
 /// One transformer block's worth of weights, in QMatMul / Tensor form.
 struct Block {
     attn_norm: Tensor, // f32, shape [hidden]
@@ -88,15 +101,15 @@ pub struct TransformerModel {
     rope_theta: f32,
     rms_eps: f64,
     vocab_size: usize,
-    // Preallocated per-layer KV cache. Each entry is (K, V) of fixed shape
-    // [1, n_kv_heads, max_seq, head_dim]. The new token's K/V is written at
-    // slot `position` along dim 2 via `slice_set` (an in-place, O(1) storage
-    // write), and attention reads back the [0..=position] prefix. This replaces
-    // the old `Tensor::cat(prev, new).contiguous()` cache, which reallocated
-    // and recopied the entire history every token — O(N^2) copying plus
-    // allocator churn over a sequence. `slice_set` writes through a shared
-    // reference, so the buffers don't need a RefCell.
-    kv_cache: Vec<(Tensor, Tensor)>,
+    // Preallocated per-layer KV cache, one `KvLayer` per block. Each holds flat
+    // f32 buffers of shape [n_kv_heads, max_seq, head_dim]. The new token's K/V
+    // is written at slot `position` in place, and the fused attention kernel
+    // reads these buffers *directly* via strides — no per-step copy of the
+    // history out of the cache, and no `.contiguous()`. This replaces both the
+    // original `Tensor::cat(...).contiguous()` cache (O(N^2) recopy) and the
+    // interim padded-Tensor cache that still did a `narrow().contiguous()` plus
+    // `to_vec1::<f32>()` of the whole prefix every decode step.
+    kv_cache: Vec<KvLayer>,
     // Sequence length the buffers above were sized for (the write/read bound).
     max_seq: usize,
     // Absolute position of the next token to be processed: both the RoPE
@@ -166,13 +179,16 @@ impl TransformerModel {
             blocks.push(load_block(model, i, device)?);
         }
 
-        // Preallocate the fixed-size KV buffers, one (K, V) pair per layer.
+        // Preallocate the fixed-size KV buffers, one KvLayer per block. Each
+        // buffer is a flat [n_kv_heads * max_seq * head_dim] f32 vec.
         let max_seq = (meta.context_length as usize).clamp(1, MAX_SEQ_LEN);
+        let layer_elems = n_kv_heads * max_seq * head_dim;
         let mut kv_cache = Vec::with_capacity(n_blocks);
         for _ in 0..n_blocks {
-            let k = Tensor::zeros((1, n_kv_heads, max_seq, head_dim), DType::F32, device)?;
-            let v = Tensor::zeros((1, n_kv_heads, max_seq, head_dim), DType::F32, device)?;
-            kv_cache.push((k, v));
+            kv_cache.push(KvLayer {
+                k: RefCell::new(vec![0f32; layer_elems]),
+                v: RefCell::new(vec![0f32; layer_elems]),
+            });
         }
 
         Ok(Self {
@@ -315,31 +331,33 @@ impl TransformerModel {
         let q = apply_rope_range(&q, pos0, self.rope_theta)?;
         let k = apply_rope_range(&k, pos0, self.rope_theta)?;
 
-        // Write this chunk's (k, v) into the KV cache at slots [pos0..pos0+q_len)
-        // and read back the contiguous causal prefix [0..pos0+q_len).
-        let (k_all, v_all) = self.append_and_read_cache(layer_idx, pos0, q_len, &k, &v)?;
-        let kv_len = pos0 + q_len;
+        // Write this chunk's (k, v) into the per-layer KV cache at slots
+        // [pos0..pos0+q_len). O(q_len) scatter — no read-back of the history.
+        self.write_cache(layer_idx, pos0, q_len, &k, &v)?;
 
         // Fused causal SDPA with online softmax. Operates on raw f32 slices:
         // streams over the KV prefix once per (head, query row), maps Q heads
         // to KV heads on the fly (no repeat_kv_heads materialization), and
         // never builds the [n_heads, q_len, kv_len] score matrix or its
-        // softmax temporaries. The contiguous prefix layout means the per-head
-        // KV stride is `kv_len * head_dim` and the per-position stride is
-        // `head_dim`.
+        // softmax temporaries. It reads the padded cache buffers
+        // ([n_kv_heads, max_seq, head_dim]) directly: per-head stride is
+        // `max_seq * head_dim`, per-position stride is `head_dim`. Only the
+        // [0..pos0+q_len) prefix of each head is populated, and the kernel's
+        // causal bound never reads past it.
         let q_vec = q.flatten_all()?.to_vec1::<f32>()?;
-        let k_vec = k_all.flatten_all()?.to_vec1::<f32>()?;
-        let v_vec = v_all.flatten_all()?.to_vec1::<f32>()?;
+        let kv = &self.kv_cache[layer_idx];
+        let k_buf = kv.k.borrow();
+        let v_buf = kv.v.borrow();
         let out = fused_sdpa(
             &q_vec,
-            &k_vec,
-            &v_vec,
+            &k_buf,
+            &v_buf,
             self.n_heads,
             self.n_kv_heads,
             self.head_dim,
             q_len,
             pos0,
-            kv_len * self.head_dim,
+            self.max_seq * self.head_dim,
             self.head_dim,
         );
         let attn = Tensor::from_vec(out, (1, self.n_heads, q_len, self.head_dim), &self.device)?;
@@ -363,16 +381,23 @@ impl TransformerModel {
         Ok((residual + ffn_out)?)
     }
 
-    fn append_and_read_cache(
+    /// Scatter this chunk's K/V into the per-layer cache buffers in place.
+    ///
+    /// `k_new` / `v_new` are `[1, n_kv_heads, q_len, head_dim]`, contiguous
+    /// (built via reshape/transpose/contiguous + RoPE upstream), so their flat
+    /// layout is `[h * q_len * head_dim + j * head_dim + d]`. The cache buffers
+    /// are padded `[n_kv_heads, max_seq, head_dim]`, so token `j` of head `h`
+    /// lands at `h * max_seq * head_dim + (pos0 + j) * head_dim + d`. We copy a
+    /// whole `head_dim`-length row at a time. No reallocation, no read-back of
+    /// the existing history — that's the O(N^2)-copy elimination over a decode.
+    fn write_cache(
         &self,
         layer_idx: usize,
         pos0: usize,
         q_len: usize,
         k_new: &Tensor,
         v_new: &Tensor,
-    ) -> anyhow::Result<(Tensor, Tensor)> {
-        // k_new / v_new: [1, n_kv_heads, q_len, head_dim], contiguous (built
-        // via reshape/transpose/contiguous + RoPE upstream).
+    ) -> anyhow::Result<()> {
         let kv_len = pos0 + q_len;
         if kv_len > self.max_seq {
             bail!(
@@ -382,22 +407,27 @@ impl TransformerModel {
             );
         }
 
-        let (k_buf, v_buf) = &self.kv_cache[layer_idx];
+        let head_dim = self.head_dim;
+        let row = head_dim; // elements per (head, position) row
+        let dst_head_stride = self.max_seq * head_dim;
+        let src_head_stride = q_len * head_dim;
 
-        // In-place write of this chunk's K/V into slots [pos0..pos0+q_len)
-        // (dim 2). No reallocation and no recopy of prior history — the heart
-        // of the speedup over the previous Tensor::cat approach.
-        k_buf.slice_set(k_new, 2, pos0)?;
-        v_buf.slice_set(v_new, 2, pos0)?;
+        let k_src = k_new.flatten_all()?.to_vec1::<f32>()?;
+        let v_src = v_new.flatten_all()?.to_vec1::<f32>()?;
 
-        // Read back the causal prefix [0..kv_len). `narrow` is a strided view;
-        // we make it contiguous so the fused kernel can read it as a dense
-        // [n_kv_heads, kv_len, head_dim] slice. This is an O(kv_len) read copy
-        // (Level 1); a raw-Vec<f32> cache would let the kernel read the buffer
-        // in place and drop even this copy (Level 2).
-        let k_all = k_buf.narrow(2, 0, kv_len)?.contiguous()?;
-        let v_all = v_buf.narrow(2, 0, kv_len)?.contiguous()?;
-        Ok((k_all, v_all))
+        let kv = &self.kv_cache[layer_idx];
+        let mut k_buf = kv.k.borrow_mut();
+        let mut v_buf = kv.v.borrow_mut();
+
+        for h in 0..self.n_kv_heads {
+            for j in 0..q_len {
+                let dst = h * dst_head_stride + (pos0 + j) * head_dim;
+                let src = h * src_head_stride + j * head_dim;
+                k_buf[dst..dst + row].copy_from_slice(&k_src[src..src + row]);
+                v_buf[dst..dst + row].copy_from_slice(&v_src[src..src + row]);
+            }
+        }
+        Ok(())
     }
 }
 
@@ -708,7 +738,11 @@ fn fused_sdpa(
     let scale = (head_dim as f32).sqrt();
     let mut out = vec![0f32; n_heads * q_len * head_dim];
 
-    for h in 0..n_heads {
+    // Per-head attention. `h` is the query head; `out_head` is its disjoint
+    // `q_len * head_dim` output slice. Reads only the shared q/k/v slices, so
+    // heads carry no cross-dependency. Indices into `out_head` are head-local
+    // (the `h * q_len * head_dim` base is implicit in the chunk).
+    let attend_head = |h: usize, out_head: &mut [f32]| {
         let k_base = (h / group) * kv_head_stride; // map Q head -> KV head
         let qh = h * q_len * head_dim;
         for qi in 0..q_len {
@@ -744,11 +778,33 @@ fn fused_sdpa(
             }
 
             let inv = 1.0 / l;
-            let o_row = &mut out[qh + qi * head_dim..qh + qi * head_dim + head_dim];
+            let o_row = &mut out_head[qi * head_dim..qi * head_dim + head_dim];
             for d in 0..head_dim {
                 o_row[d] = acc[d] * inv;
             }
         }
+    };
+
+    // Heads are embarrassingly parallel, but the rayon fork/join costs a few
+    // tens of microseconds — more than the whole kernel at short-context decode
+    // (q_len=1, small kv_len), where multithreading measured ~2.4x *slower*.
+    // It's a 5–6x win once the work is large (long-context decode, or any
+    // prefill). Gate on a cheap estimate of total inner iterations,
+    // `n_heads * Σ_qi (pos0 + qi + 1)`, and only fan out past the crossover.
+    // (Threshold ~8k iters sits between decode kv=128 ≈ 2k and kv=1024 ≈ 16k,
+    // measured on a 12-core box; see bench_sdpa.)
+    const PAR_WORK_THRESHOLD: usize = 8192;
+    let key_iters_per_head = q_len * (2 * pos0 + q_len + 1) / 2;
+    let total_iters = n_heads * key_iters_per_head;
+
+    if total_iters >= PAR_WORK_THRESHOLD {
+        out.par_chunks_mut(q_len * head_dim)
+            .enumerate()
+            .for_each(|(h, out_head)| attend_head(h, out_head));
+    } else {
+        out.chunks_mut(q_len * head_dim)
+            .enumerate()
+            .for_each(|(h, out_head)| attend_head(h, out_head));
     }
     out
 }
