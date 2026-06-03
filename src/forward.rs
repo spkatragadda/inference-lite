@@ -98,7 +98,6 @@ pub struct TransformerModel {
     n_kv_heads: usize,
     head_dim: usize,
     hidden_dim: usize,
-    rope_theta: f32,
     rms_eps: f64,
     vocab_size: usize,
     // Preallocated per-layer KV cache, one `KvLayer` per block. Each holds flat
@@ -112,6 +111,11 @@ pub struct TransformerModel {
     kv_cache: Vec<KvLayer>,
     // Sequence length the buffers above were sized for (the write/read bound).
     max_seq: usize,
+    // Precomputed RoPE sin/cos tables, shape [max_seq, head_dim/2], built once
+    // at load. `apply_rope_range` slices rows [pos0..pos0+q_len) instead of
+    // recomputing powf/cos/sin per call, per layer, per forward.
+    rope_cos: Tensor,
+    rope_sin: Tensor,
     // Absolute position of the next token to be processed: both the RoPE
     // position and the KV-cache write slot.
     position: RefCell<usize>,
@@ -182,6 +186,9 @@ impl TransformerModel {
         // Preallocate the fixed-size KV buffers, one KvLayer per block. Each
         // buffer is a flat [n_kv_heads * max_seq * head_dim] f32 vec.
         let max_seq = (meta.context_length as usize).clamp(1, MAX_SEQ_LEN);
+        // Precompute the position-independent RoPE tables once for all positions
+        // the KV cache can ever address (0..max_seq).
+        let (rope_cos, rope_sin) = build_rope_tables(max_seq, head_dim, rope_theta, device)?;
         let layer_elems = n_kv_heads * max_seq * head_dim;
         let mut kv_cache = Vec::with_capacity(n_blocks);
         for _ in 0..n_blocks {
@@ -201,11 +208,12 @@ impl TransformerModel {
             n_kv_heads,
             head_dim,
             hidden_dim,
-            rope_theta,
             rms_eps,
             vocab_size,
             kv_cache,
             max_seq,
+            rope_cos,
+            rope_sin,
             position: RefCell::new(0),
         })
     }
@@ -328,8 +336,8 @@ impl TransformerModel {
 
         // RoPE on Q and K. Row j along the seq axis is at absolute position
         // pos0 + j (so prefill rotates each prompt token by its own position).
-        let q = apply_rope_range(&q, pos0, self.rope_theta)?;
-        let k = apply_rope_range(&k, pos0, self.rope_theta)?;
+        let q = apply_rope_range(&q, pos0, &self.rope_cos, &self.rope_sin)?;
+        let k = apply_rope_range(&k, pos0, &self.rope_cos, &self.rope_sin)?;
 
         // Write this chunk's (k, v) into the per-layer KV cache at slots
         // [pos0..pos0+q_len). O(q_len) scatter — no read-back of the history.
@@ -678,33 +686,55 @@ fn silu(x: &Tensor) -> anyhow::Result<Tensor> {
 /// Qwen) to a tensor shaped `[1, n_heads, q_len, head_dim]`. Row `j` along the
 /// seq axis is treated as absolute position `pos0 + j`, so during prefill each
 /// prompt token is rotated by its own position in one call.
-fn apply_rope_range(x: &Tensor, pos0: usize, theta_base: f32) -> anyhow::Result<Tensor> {
+fn apply_rope_range(
+    x: &Tensor,
+    pos0: usize,
+    cos_tab: &Tensor,
+    sin_tab: &Tensor,
+) -> anyhow::Result<Tensor> {
     let head_dim = x.dim(D::Minus1)?;
     let q_len = x.dim(2)?;
     let half = head_dim / 2;
-    let device = x.device();
 
-    // Build the [q_len, half] sin/cos table for positions pos0..pos0+q_len.
-    let mut cos_vals = Vec::with_capacity(q_len * half);
-    let mut sin_vals = Vec::with_capacity(q_len * half);
-    for j in 0..q_len {
-        let pos = (pos0 + j) as f32;
-        for i in 0..half {
-            let freq = (theta_base).powf(-(2.0 * i as f32) / head_dim as f32);
-            let angle = pos * freq;
-            cos_vals.push(angle.cos());
-            sin_vals.push(angle.sin());
-        }
-    }
-    // Shape [1, 1, q_len, half] broadcasts over the n_heads axis.
-    let cos = Tensor::from_vec(cos_vals, (1, 1, q_len, half), device)?.to_dtype(x.dtype())?;
-    let sin = Tensor::from_vec(sin_vals, (1, 1, q_len, half), device)?.to_dtype(x.dtype())?;
+    // Slice the precomputed tables for positions pos0..pos0+q_len. Shape
+    // [1, 1, q_len, half] broadcasts over the n_heads axis. The KV-cache bound
+    // (pos0 + q_len <= max_seq, enforced in write_cache) guarantees this slice
+    // stays in range, since the tables are sized to max_seq.
+    let cos = cos_tab.narrow(0, pos0, q_len)?.reshape((1, 1, q_len, half))?;
+    let sin = sin_tab.narrow(0, pos0, q_len)?.reshape((1, 1, q_len, half))?;
 
     let x1 = x.narrow(D::Minus1, 0, half)?;
     let x2 = x.narrow(D::Minus1, half, half)?;
     let rotated_1 = (x1.broadcast_mul(&cos)? - x2.broadcast_mul(&sin)?)?;
     let rotated_2 = (x2.broadcast_mul(&cos)? + x1.broadcast_mul(&sin)?)?;
     Ok(Tensor::cat(&[&rotated_1, &rotated_2], D::Minus1)?.contiguous()?)
+}
+
+/// Precompute the RoPE sin/cos tables for every position in `0..max_seq`,
+/// returning two `[max_seq, head_dim/2]` f32 tensors. The frequency
+/// `theta_base^(-2i/head_dim)` is position-independent, so building this once at
+/// load replaces the per-call powf/cos/sin work in [`apply_rope_range`]. This is
+/// also the seam for any RoPE scaling (YaRN / NTK / linear interpolation).
+fn build_rope_tables(
+    max_seq: usize,
+    head_dim: usize,
+    theta_base: f32,
+    device: &Device,
+) -> anyhow::Result<(Tensor, Tensor)> {
+    let half = head_dim / 2;
+    let mut cos_vals = Vec::with_capacity(max_seq * half);
+    let mut sin_vals = Vec::with_capacity(max_seq * half);
+    for pos in 0..max_seq {
+        for i in 0..half {
+            let freq = (theta_base).powf(-(2.0 * i as f32) / head_dim as f32);
+            let angle = pos as f32 * freq;
+            cos_vals.push(angle.cos());
+            sin_vals.push(angle.sin());
+        }
+    }
+    let cos = Tensor::from_vec(cos_vals, (max_seq, half), device)?;
+    let sin = Tensor::from_vec(sin_vals, (max_seq, half), device)?;
+    Ok((cos, sin))
 }
 
 /// Fused causal scaled-dot-product attention with online (streaming) softmax.
