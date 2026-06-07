@@ -40,6 +40,15 @@ use crate::gguf_parser::{InferenceModel, NamedTensor};
 /// we trade a fixed window for zero-allocation decoding.
 const MAX_SEQ_LEN: usize = 4096;
 
+/// StreamingLLM (attention-sink) parameters. When the cache fills, the first
+/// `DEFAULT_N_SINK` tokens are kept as permanent "sinks" and the oldest recent
+/// tokens are evicted in blocks so generation can continue past the window
+/// instead of erroring. Each overflow drops `(max_seq - n_sink) / EVICT_FRACTION`
+/// recent tokens at once (amortizes the compaction memmove + key re-rotation
+/// over many decode steps).
+const DEFAULT_N_SINK: usize = 4;
+const EVICT_FRACTION: usize = 4;
+
 /// Which QKV layout this block uses. Older LLaMA-style models keep Q, K, V
 /// as three separate projection tensors; newer Qwen variants (Qwen3.5,
 /// Qwen3-Next) fuse them into a single `attn_qkv.weight` of shape
@@ -117,8 +126,14 @@ pub struct TransformerModel {
     rope_cos: Tensor,
     rope_sin: Tensor,
     // Absolute position of the next token to be processed: both the RoPE
-    // position and the KV-cache write slot.
+    // position and the KV-cache write slot. Under streaming this also moves
+    // *backward* on eviction (the cache is compacted so slot == position holds).
     position: RefCell<usize>,
+    // StreamingLLM (attention-sink) config. When `enable_streaming` is set, a
+    // full cache evicts the oldest recent tokens instead of erroring; the first
+    // `n_sink` tokens are never evicted.
+    n_sink: usize,
+    enable_streaming: bool,
 }
 
 impl TransformerModel {
@@ -186,6 +201,12 @@ impl TransformerModel {
         // Preallocate the fixed-size KV buffers, one KvLayer per block. Each
         // buffer is a flat [n_kv_heads * max_seq * head_dim] f32 vec.
         let max_seq = (meta.context_length as usize).clamp(1, MAX_SEQ_LEN);
+
+        // StreamingLLM config. Streaming is on by default; n_sink is clamped so
+        // at least one recent slot remains evictable.
+        let enable_streaming = true;
+        let n_sink = DEFAULT_N_SINK.min(max_seq.saturating_sub(1));
+
         // Precompute the position-independent RoPE tables once for all positions
         // the KV cache can ever address (0..max_seq).
         let (rope_cos, rope_sin) = build_rope_tables(max_seq, head_dim, rope_theta, device)?;
@@ -215,6 +236,8 @@ impl TransformerModel {
             rope_cos,
             rope_sin,
             position: RefCell::new(0),
+            n_sink,
+            enable_streaming,
         })
     }
 
@@ -228,13 +251,66 @@ impl TransformerModel {
     /// which is then advanced by `token_ids.len()`. Returns logits for the
     /// LAST position only, shape `[1, vocab]` — the only row that feeds
     /// next-token sampling.
+    ///
+    /// With streaming enabled, a chunk that would overrun the window is split
+    /// into sub-chunks and the oldest recent tokens are evicted between them
+    /// (StreamingLLM), so prompts and generations longer than `max_seq` keep
+    /// going instead of erroring. With streaming off, the whole chunk is written
+    /// in one pass and `write_cache` enforces the hard bound as before.
     pub fn forward_chunk(&self, token_ids: &[u32]) -> anyhow::Result<Tensor> {
-        let q_len = token_ids.len();
-        if q_len == 0 {
+        let total = token_ids.len();
+        if total == 0 {
             bail!("forward_chunk called with an empty token slice");
         }
-        let pos0 = *self.position.borrow();
 
+        if !self.enable_streaming {
+            // Original single-pass path. Check the window bound up front so the
+            // error is the informative "cache full" one rather than an opaque
+            // RoPE-table narrow failure (table slicing happens before write_cache).
+            let pos0 = *self.position.borrow();
+            if pos0 + total > self.max_seq {
+                bail!(
+                    "KV cache full: chunk needs slots [{pos0}..{}) but max_seq is {}. \
+                     Raise MAX_SEQ_LEN, lower the prompt/output length, or enable \
+                     streaming.",
+                    pos0 + total,
+                    self.max_seq
+                );
+            }
+            let last = self.run_chunk(token_ids, pos0)?;
+            *self.position.borrow_mut() = pos0 + total;
+            return self.finish_logits(&last);
+        }
+
+        // Streaming path: process in sub-chunks that each fit the remaining
+        // window, evicting a block of recent tokens whenever the cache is full.
+        // Only the final sub-chunk's last row feeds sampling, so lm_head runs
+        // once at the end.
+        let mut offset = 0;
+        let mut last_hidden = None;
+        while offset < total {
+            if *self.position.borrow() >= self.max_seq {
+                self.evict_block()?;
+            }
+            let pos0 = *self.position.borrow();
+            let room = self.max_seq - pos0; // >= 1 after the eviction above
+            let take = (total - offset).min(room);
+            let sub = &token_ids[offset..offset + take];
+            last_hidden = Some(self.run_chunk(sub, pos0)?);
+            *self.position.borrow_mut() = pos0 + take;
+            offset += take;
+        }
+
+        self.finish_logits(&last_hidden.expect("at least one sub-chunk runs"))
+    }
+
+    /// Embedding lookup + all transformer blocks for one sub-chunk whose tokens
+    /// occupy absolute slots `[pos0, pos0 + token_ids.len())`. Writes this
+    /// chunk's K/V into the cache in place but does NOT advance `position` (the
+    /// caller owns that, since eviction can move it). Returns the LAST row's
+    /// hidden state `[1, 1, hidden]` for the final norm + lm_head.
+    fn run_chunk(&self, token_ids: &[u32], pos0: usize) -> anyhow::Result<Tensor> {
+        let q_len = token_ids.len();
         // Embedding lookup for every token in the chunk -> [1, q_len, hidden].
         // One batched gather instead of a per-token row index.
         let ids = Tensor::from_slice(token_ids, (q_len,), &self.device)?;
@@ -246,15 +322,55 @@ impl TransformerModel {
         for (i, block) in self.blocks.iter().enumerate() {
             x = self.run_block(&x, block, i, pos0, q_len)?;
         }
+        Ok(x.narrow(1, q_len - 1, 1)?) // [1, 1, hidden]
+    }
 
-        // Only the last position feeds sampling, so run the final RMSNorm and
-        // the vocab-wide lm_head on a single row rather than all q_len rows.
-        let last = x.narrow(1, q_len - 1, 1)?; // [1, 1, hidden]
-        let normed = rms_norm(&last, &self.final_norm, self.rms_eps)?;
-        let logits = self.lm_head.forward(&normed)?.reshape((1, self.vocab_size))?;
+    /// Final RMSNorm + vocab-wide lm_head on a single row -> logits `[1, vocab]`.
+    fn finish_logits(&self, last_hidden: &Tensor) -> anyhow::Result<Tensor> {
+        let normed = rms_norm(last_hidden, &self.final_norm, self.rms_eps)?;
+        Ok(self.lm_head.forward(&normed)?.reshape((1, self.vocab_size))?)
+    }
 
-        *self.position.borrow_mut() = pos0 + q_len;
-        Ok(logits)
+    /// Evict one block of the oldest recent tokens to free cache slots, keeping
+    /// the `n_sink` sink tokens. Drops `(max_seq - n_sink) / EVICT_FRACTION`
+    /// tokens (>=1), capped by how many recent tokens exist. Compacts each
+    /// layer's cache and re-rotates the surviving keys so `slot == position`
+    /// still holds, then moves `position` back by the evicted count.
+    fn evict_block(&self) -> anyhow::Result<()> {
+        let used = *self.position.borrow();
+        let recent = used.saturating_sub(self.n_sink);
+        if recent == 0 {
+            bail!(
+                "streaming eviction: nothing to evict (n_sink {} >= used {used}); \
+                 raise MAX_SEQ_LEN or lower DEFAULT_N_SINK",
+                self.n_sink
+            );
+        }
+        let block = ((self.max_seq - self.n_sink) / EVICT_FRACTION).max(1);
+        self.evict(block.min(recent))
+    }
+
+    /// Drop the `evict` oldest recent tokens from every layer's KV cache and
+    /// re-rotate the survivors to their new positions (see
+    /// [`evict_and_rotate_keys`]). Decrements `position` by `evict`.
+    fn evict(&self, evict: usize) -> anyhow::Result<()> {
+        let used = *self.position.borrow();
+        debug_assert!(self.n_sink + evict <= used, "eviction would touch the sinks");
+        // Row `evict` of the precomputed tables: cos/sin(evict * theta_d). One
+        // lookup, shared across all layers and heads.
+        let cos_e = self.rope_cos.narrow(0, evict, 1)?.flatten_all()?.to_vec1::<f32>()?;
+        let sin_e = self.rope_sin.narrow(0, evict, 1)?.flatten_all()?.to_vec1::<f32>()?;
+        for layer in &self.kv_cache {
+            let mut k = layer.k.borrow_mut();
+            let mut v = layer.v.borrow_mut();
+            evict_and_rotate_keys(
+                &mut k, self.n_kv_heads, self.head_dim, self.max_seq, self.n_sink, used,
+                evict, &cos_e, &sin_e,
+            );
+            evict_values(&mut v, self.n_kv_heads, self.head_dim, self.max_seq, self.n_sink, used, evict);
+        }
+        *self.position.borrow_mut() = used - evict;
+        Ok(())
     }
 
     /// Single-token convenience wrapper over [`Self::forward_chunk`] for the
@@ -737,6 +853,86 @@ fn build_rope_tables(
     Ok((cos, sin))
 }
 
+/// Slide the recent-window keys down by `evict` slots and re-rotate them to
+/// their new (lower) RoPE positions — the StreamingLLM (attention-sink) cache
+/// compaction step. Operates in place on one layer's flat K buffer, shaped
+/// `[n_kv_heads, max_seq, head_dim]` (per-head stride `max_seq * head_dim`).
+///
+/// Layout invariant kept by this routine: `slot index == RoPE position`. Sink
+/// slots `[0, n_sink)` are never touched. The `evict` oldest *recent* slots
+/// `[n_sink, n_sink+evict)` are dropped; survivors `[n_sink+evict, used)` move
+/// down to `[n_sink, used-evict)`.
+///
+/// Keys are stored already rotated by their absolute position `p` (RoPE is
+/// applied before `write_cache`). After the shift a survivor must be rotated by
+/// `p - evict` instead. Going from `p` to `p - evict` is a rotation by
+/// `-evict * theta_d` per frequency pair `(d, d+half)`, which is *independent of
+/// `p`* — so every survivor gets the same correction. The needed factors are
+/// exactly row `evict` of the precomputed tables:
+///   `cos_e[d] = cos(evict * theta_d)`, `sin_e[d] = sin(evict * theta_d)`.
+/// For a stored pair `(a, b) = (k[d], k[half+d])` the inverse rotation `R(-Eθ)`
+/// gives `(a*cos_e + b*sin_e, -a*sin_e + b*cos_e)`, which equals rotating the
+/// raw key by `p - evict` (verified in `delta_rotate_matches_rerotation`).
+///
+/// In-place safety: the move is downward (`dst = src - evict*head_dim`), so a
+/// destination row never overlaps its own source row. Iterating slots ascending
+/// means each slot is read as a source before it can be overwritten as a
+/// destination (its write happens `evict` steps later), so no live data is
+/// clobbered.
+#[allow(clippy::too_many_arguments)]
+fn evict_and_rotate_keys(
+    k_buf: &mut [f32],
+    n_kv_heads: usize,
+    head_dim: usize,
+    max_seq: usize,
+    n_sink: usize,
+    used: usize,
+    evict: usize,
+    cos_e: &[f32],
+    sin_e: &[f32],
+) {
+    let half = head_dim / 2;
+    let head_stride = max_seq * head_dim;
+    for h in 0..n_kv_heads {
+        let base = h * head_stride;
+        for slot in (n_sink + evict)..used {
+            let src = base + slot * head_dim;
+            let dst = base + (slot - evict) * head_dim;
+            for d in 0..half {
+                let a = k_buf[src + d];
+                let b = k_buf[src + half + d];
+                let c = cos_e[d];
+                let s = sin_e[d];
+                k_buf[dst + d] = a * c + b * s;
+                k_buf[dst + half + d] = -a * s + b * c;
+            }
+        }
+    }
+}
+
+/// V counterpart of [`evict_and_rotate_keys`]: V is never rotated, so eviction
+/// is a pure downward shift of the recent window. Each head's survivor span is
+/// contiguous, so it moves in one `copy_within` (memmove semantics handle the
+/// overlap) rather than slot by slot.
+fn evict_values(
+    v_buf: &mut [f32],
+    n_kv_heads: usize,
+    head_dim: usize,
+    max_seq: usize,
+    n_sink: usize,
+    used: usize,
+    evict: usize,
+) {
+    let head_stride = max_seq * head_dim;
+    for h in 0..n_kv_heads {
+        let base = h * head_stride;
+        let src_start = base + (n_sink + evict) * head_dim;
+        let src_end = base + used * head_dim;
+        let dst_start = base + n_sink * head_dim;
+        v_buf.copy_within(src_start..src_end, dst_start);
+    }
+}
+
 /// Fused causal scaled-dot-product attention with online (streaming) softmax.
 ///
 /// One pass over the KV prefix per `(head, query row)`: never materializes the
@@ -952,5 +1148,113 @@ mod tests {
         // MHA (no GQA) and MQA (single KV head).
         check_case(8, 8, 64, 4, 3);
         check_case(8, 1, 64, 6, 2);
+    }
+
+    /// The StreamingLLM compaction identity: a key stored rotated by position
+    /// `p`, then delta-rotated by `evict` via `evict_and_rotate_keys`, must equal
+    /// the raw key rotated directly by `p - evict`. Exact up to fp rounding.
+    #[test]
+    fn delta_rotate_matches_rerotation() {
+        let device = Device::Cpu;
+        let head_dim = 8;
+        let max_seq = 64;
+        let theta = 10000.0f32;
+        let (cos_tab, sin_tab) = build_rope_tables(max_seq, head_dim, theta, &device).unwrap();
+
+        // Forward-rotate a raw head_dim vector by absolute position `p`, exactly
+        // as apply_rope_range does at write time.
+        let rotate_at = |raw: &[f32], p: usize| -> Vec<f32> {
+            let x = Tensor::from_vec(raw.to_vec(), (1, 1, 1, head_dim), &device).unwrap();
+            apply_rope_range(&x, p, &cos_tab, &sin_tab)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
+        };
+        // Row `e` of a table = cos/sin(e * theta_d), as `evict` extracts it.
+        let row = |tab: &Tensor, e: usize| -> Vec<f32> {
+            tab.narrow(0, e, 1)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
+        };
+
+        let n_kv_heads = 2;
+        let head_stride = max_seq * head_dim;
+        // (position of the survivor, evict count, sink count). Requires
+        // p in [n_sink + evict, used) with used = p + 1.
+        for &(p, evict, n_sink) in &[(40usize, 7usize, 2usize), (12, 4, 0), (63, 1, 3)] {
+            let used = p + 1;
+            let mut k_buf = vec![0f32; n_kv_heads * head_stride];
+            let mut raws = Vec::new();
+            for h in 0..n_kv_heads {
+                // Distinct raw key per head.
+                let raw: Vec<f32> = (0..head_dim)
+                    .map(|d| (h as f32 + 1.0) * (d as f32 - 3.5))
+                    .collect();
+                let stored = rotate_at(&raw, p); // as written into the cache
+                let dst = h * head_stride + p * head_dim;
+                k_buf[dst..dst + head_dim].copy_from_slice(&stored);
+                raws.push(raw);
+            }
+
+            let cos_e = row(&cos_tab, evict);
+            let sin_e = row(&sin_tab, evict);
+            evict_and_rotate_keys(
+                &mut k_buf, n_kv_heads, head_dim, max_seq, n_sink, used, evict, &cos_e, &sin_e,
+            );
+
+            for h in 0..n_kv_heads {
+                let expected = rotate_at(&raws[h], p - evict);
+                let off = h * head_stride + (p - evict) * head_dim;
+                let got = &k_buf[off..off + head_dim];
+                let max_diff = got
+                    .iter()
+                    .zip(&expected)
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0f32, f32::max);
+                assert!(max_diff < 1e-5, "p={p} evict={evict} h={h}: max_diff={max_diff}");
+            }
+        }
+    }
+
+    /// `evict_values` shifts the recent window down by `evict` slots, leaves the
+    /// sinks in place, and lands old slot `s+evict` at new slot `s`.
+    #[test]
+    fn evict_values_shifts_window() {
+        let head_dim = 4;
+        let max_seq = 16;
+        let n_kv_heads = 2;
+        let head_stride = max_seq * head_dim;
+        let (used, n_sink, evict) = (10usize, 2usize, 3usize);
+
+        // Tag each (head, slot) row with a unique value head*100 + slot.
+        let mut v = vec![0f32; n_kv_heads * head_stride];
+        for h in 0..n_kv_heads {
+            for slot in 0..used {
+                let off = h * head_stride + slot * head_dim;
+                for d in 0..head_dim {
+                    v[off + d] = (h * 100 + slot) as f32;
+                }
+            }
+        }
+
+        evict_values(&mut v, n_kv_heads, head_dim, max_seq, n_sink, used, evict);
+
+        for h in 0..n_kv_heads {
+            // Sinks untouched.
+            for slot in 0..n_sink {
+                let off = h * head_stride + slot * head_dim;
+                assert_eq!(v[off], (h * 100 + slot) as f32);
+            }
+            // Survivors shifted down: new slot `s` holds old slot `s + evict`.
+            for s in n_sink..(used - evict) {
+                let off = h * head_stride + s * head_dim;
+                assert_eq!(v[off], (h * 100 + s + evict) as f32, "h={h} s={s}");
+            }
+        }
     }
 }
