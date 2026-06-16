@@ -1,5 +1,6 @@
 use candle_core::Device;
 use inference_lite::engine::Engine;
+use inference_lite::forward::WeightPrecision;
 use std::io::Write;
 
 /// One-shot CLI: load a GGUF, run a single prompt, stream the response, and
@@ -9,9 +10,14 @@ use std::io::Write;
 fn main() -> anyhow::Result<()> {
     let device = Device::Cpu;
 
-    let model_path = "./Qwen3-0.6B-Q4_0.gguf";
-    println!("Loading GGUF weights into memory: {model_path}");
-    let engine = Engine::load(model_path, &device)?;
+    let model_path =
+        std::env::var("MODEL_PATH").unwrap_or_else(|_| "./Qwen3-0.6B-Q4_0.gguf".to_string());
+    let model_path = model_path.as_str();
+    // Weight precision: f16 (faster CPU matmul) by default; set
+    // WEIGHT_DTYPE=quantized to keep the native quantized kernel / smaller RAM.
+    let precision = WeightPrecision::from_env();
+    println!("Loading GGUF weights into memory: {model_path} (weights: {precision:?})");
+    let engine = Engine::load(model_path, &device, precision)?;
     println!("Loaded model (arch: {}).", engine.arch());
 
     // CLI override: `cargo run --bin inference -- "your prompt here"`.

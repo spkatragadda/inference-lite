@@ -49,6 +49,47 @@ const MAX_SEQ_LEN: usize = 4096;
 const DEFAULT_N_SINK: usize = 4;
 const EVICT_FRACTION: usize = 4;
 
+/// How the linear-layer weights are kept in memory, which selects the matmul
+/// kernel candle dispatches to.
+///
+/// - `Quantized` keeps the GGUF's native blocks (e.g. Q4_0) and runs candle's
+///   quantized `vec_dot` GEMM. Smallest footprint (the on-disk size), but its
+///   CPU kernel is the throughput bottleneck on x86.
+/// - `F16` dequantizes every weight to f16 once at load and runs candle's
+///   `gemm` matmul instead. ~2x the RAM of a 4-bit GGUF, but measured ~1.9x
+///   faster decode / ~1.7x faster prefill on AVX2 (the dominant cost is these
+///   matmuls; see the benchmark notes). This is the recommended default on CPU.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WeightPrecision {
+    Quantized,
+    F16,
+}
+
+impl WeightPrecision {
+    /// Read the `WEIGHT_DTYPE` env var: `quantized`/`q` keeps the native
+    /// quantized kernel, anything else (or unset) selects the faster f16 path.
+    pub fn from_env() -> Self {
+        match std::env::var("WEIGHT_DTYPE").as_deref() {
+            Ok("quantized") | Ok("q") | Ok("Q4_0") | Ok("q4_0") => Self::Quantized,
+            _ => Self::F16,
+        }
+    }
+}
+
+/// Build a `QMatMul` for one weight under the chosen precision. `Quantized`
+/// wraps the GGUF blocks as-is (candle's `vec_dot` path); `F16` dequantizes to
+/// f16 up front so candle uses its `gemm` matmul.
+fn build_qmatmul(
+    qtensor: std::sync::Arc<candle_core::quantized::QTensor>,
+    precision: WeightPrecision,
+    device: &Device,
+) -> anyhow::Result<QMatMul> {
+    match precision {
+        WeightPrecision::Quantized => Ok(QMatMul::from_arc(qtensor)?),
+        WeightPrecision::F16 => Ok(QMatMul::TensorF16(qtensor.dequantize_f16(device)?)),
+    }
+}
+
 /// Which QKV layout this block uses. Older LLaMA-style models keep Q, K, V
 /// as three separate projection tensors; newer Qwen variants (Qwen3.5,
 /// Qwen3-Next) fuse them into a single `attn_qkv.weight` of shape
@@ -147,7 +188,13 @@ impl TransformerModel {
 
     /// Build the model from a parsed GGUF. Hyperparameters come from
     /// `model.metadata`; per-block tensors are looked up by name pattern.
-    pub fn load(model: &InferenceModel, device: &Device) -> anyhow::Result<Self> {
+    /// `precision` selects how linear weights are stored / which matmul kernel
+    /// runs (see [`WeightPrecision`]).
+    pub fn load(
+        model: &InferenceModel,
+        device: &Device,
+        precision: WeightPrecision,
+    ) -> anyhow::Result<Self> {
         let arch = model.metadata.architecture.as_str();
         // Whitelist of architectures known to follow the LLaMA-family template.
         match arch {
@@ -188,14 +235,14 @@ impl TransformerModel {
 
         // `output.weight` is sometimes absent and tied to the embedding.
         let lm_head = match model.tensors.get("output.weight") {
-            Some(t) => QMatMul::from_arc(t.qtensor.clone())?,
-            None => QMatMul::from_arc(embed_q.qtensor.clone())?,
+            Some(t) => build_qmatmul(t.qtensor.clone(), precision, device)?,
+            None => build_qmatmul(embed_q.qtensor.clone(), precision, device)?,
         };
 
         let n_blocks = meta.block_count as usize;
         let mut blocks = Vec::with_capacity(n_blocks);
         for i in 0..n_blocks {
-            blocks.push(load_block(model, i, device)?);
+            blocks.push(load_block(model, i, device, precision)?);
         }
 
         // Preallocate the fixed-size KV buffers, one KvLayer per block. Each
@@ -319,8 +366,12 @@ impl TransformerModel {
             .index_select(&ids, 0)?
             .reshape((1, q_len, self.hidden_dim))?;
 
+        let _t = std::time::Instant::now();
         for (i, block) in self.blocks.iter().enumerate() {
             x = self.run_block(&x, block, i, pos0, q_len)?;
+        }
+        if std::env::var("PROF").is_ok() {
+            eprintln!("[prof] {} blocks: {:.2}ms", self.blocks.len(), _t.elapsed().as_secs_f64() * 1e3);
         }
         Ok(x.narrow(1, q_len - 1, 1)?) // [1, 1, hidden]
     }
@@ -328,7 +379,12 @@ impl TransformerModel {
     /// Final RMSNorm + vocab-wide lm_head on a single row -> logits `[1, vocab]`.
     fn finish_logits(&self, last_hidden: &Tensor) -> anyhow::Result<Tensor> {
         let normed = rms_norm(last_hidden, &self.final_norm, self.rms_eps)?;
-        Ok(self.lm_head.forward(&normed)?.reshape((1, self.vocab_size))?)
+        let _t = std::time::Instant::now();
+        let logits = self.lm_head.forward(&normed)?.reshape((1, self.vocab_size))?;
+        if std::env::var("PROF").is_ok() {
+            eprintln!("[prof] lm_head: {:.2}ms", _t.elapsed().as_secs_f64() * 1e3);
+        }
+        Ok(logits)
     }
 
     /// Evict one block of the oldest recent tokens to free cache slots, keeping
@@ -502,7 +558,8 @@ impl TransformerModel {
         let up = block.up_proj.forward(&h)?;
         let gated = silu(&gate)?.mul(&up)?;
         let ffn_out = block.down_proj.forward(&gated)?;
-        Ok((residual + ffn_out)?)
+        let r = (residual + ffn_out)?;
+        Ok(r)
     }
 
     /// Scatter this chunk's K/V into the per-layer cache buffers in place.
@@ -555,7 +612,12 @@ impl TransformerModel {
     }
 }
 
-fn load_block(model: &InferenceModel, i: usize, device: &Device) -> anyhow::Result<Block> {
+fn load_block(
+    model: &InferenceModel,
+    i: usize,
+    device: &Device,
+    precision: WeightPrecision,
+) -> anyhow::Result<Block> {
     let p = format!("blk.{i}");
     let prefix = format!("{p}.");
 
@@ -615,18 +677,18 @@ fn load_block(model: &InferenceModel, i: usize, device: &Device) -> anyhow::Resu
     .dequantize(device)?
     .to_dtype(DType::F32)?;
 
-    let qkv = build_qkv_projection(model, &p, device)?;
+    let qkv = build_qkv_projection(model, &p, device, precision)?;
 
     Ok(Block {
         attn_norm,
         qkv,
-        o_proj: qmatmul(model, &format!("{p}.attn_output.weight"))?,
+        o_proj: qmatmul(model, &format!("{p}.attn_output.weight"), precision, device)?,
         q_head_norm: optional_norm(model, &format!("{p}.attn_q_norm.weight"), device)?,
         k_head_norm: optional_norm(model, &format!("{p}.attn_k_norm.weight"), device)?,
         ffn_norm,
-        gate_proj: qmatmul(model, &format!("{p}.ffn_gate.weight"))?,
-        up_proj: qmatmul(model, &format!("{p}.ffn_up.weight"))?,
-        down_proj: qmatmul(model, &format!("{p}.ffn_down.weight"))?,
+        gate_proj: qmatmul(model, &format!("{p}.ffn_gate.weight"), precision, device)?,
+        up_proj: qmatmul(model, &format!("{p}.ffn_up.weight"), precision, device)?,
+        down_proj: qmatmul(model, &format!("{p}.ffn_down.weight"), precision, device)?,
     })
 }
 
@@ -637,13 +699,14 @@ fn build_qkv_projection(
     model: &InferenceModel,
     p: &str,
     device: &Device,
+    precision: WeightPrecision,
 ) -> anyhow::Result<QkvProjection> {
     let prefix = format!("{p}.");
 
     // 1) Fused: single `attn_qkv.weight` (optionally with `.bias`).
     if let Some(t) = model.tensors.get(&format!("{p}.attn_qkv.weight")) {
         return Ok(QkvProjection::Fused {
-            qkv: QMatMul::from_arc(t.qtensor.clone())
+            qkv: build_qmatmul(t.qtensor.clone(), precision, device)
                 .map_err(|e| anyhow!("QMatMul build failed for {p}.attn_qkv.weight: {e}"))?,
             bias: optional_bias(model, &format!("{p}.attn_qkv.bias"), device)?,
         });
@@ -655,9 +718,9 @@ fn build_qkv_projection(
         .all(|s| model.tensors.contains_key(&format!("{p}.{s}")));
     if has_split {
         return Ok(QkvProjection::Split {
-            q: qmatmul(model, &format!("{p}.attn_q.weight"))?,
-            k: qmatmul(model, &format!("{p}.attn_k.weight"))?,
-            v: qmatmul(model, &format!("{p}.attn_v.weight"))?,
+            q: qmatmul(model, &format!("{p}.attn_q.weight"), precision, device)?,
+            k: qmatmul(model, &format!("{p}.attn_k.weight"), precision, device)?,
+            v: qmatmul(model, &format!("{p}.attn_v.weight"), precision, device)?,
             q_bias: optional_bias(model, &format!("{p}.attn_q.bias"), device)?,
             k_bias: optional_bias(model, &format!("{p}.attn_k.bias"), device)?,
             v_bias: optional_bias(model, &format!("{p}.attn_v.bias"), device)?,
@@ -744,9 +807,14 @@ fn optional_norm(
     }
 }
 
-fn qmatmul(model: &InferenceModel, name: &str) -> anyhow::Result<QMatMul> {
+fn qmatmul(
+    model: &InferenceModel,
+    name: &str,
+    precision: WeightPrecision,
+    device: &Device,
+) -> anyhow::Result<QMatMul> {
     let t = get_tensor(model, name)?;
-    QMatMul::from_arc(t.qtensor.clone())
+    build_qmatmul(t.qtensor.clone(), precision, device)
         .map_err(|e| anyhow!("QMatMul build failed for {name}: {e}"))
 }
 

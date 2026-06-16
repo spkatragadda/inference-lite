@@ -16,7 +16,7 @@ use tokenizers::pre_tokenizers::split::{Split, SplitPattern};
 use tokenizers::pre_tokenizers::PreTokenizerWrapper;
 use tokenizers::{AddedToken, SplitDelimiterBehavior, Tokenizer};
 
-use crate::forward::TransformerModel;
+use crate::forward::{TransformerModel, WeightPrecision};
 use crate::gguf_parser::{parse_gguf, InferenceModel};
 
 /// A loaded model ready to serve requests. Holds the transformer (with its
@@ -45,12 +45,15 @@ pub struct GenOutput {
 impl Engine {
     /// Parse the GGUF, build the transformer and tokenizer. This is the slow,
     /// one-time step (dequantizes the embedding, allocates the KV cache, etc.).
-    pub fn load(model_path: &str, device: &Device) -> Result<Self> {
+    /// `precision` selects how linear weights are stored / which matmul kernel
+    /// runs (see [`WeightPrecision`]); `WeightPrecision::F16` is the faster CPU
+    /// default at ~2x the weight RAM.
+    pub fn load(model_path: &str, device: &Device, precision: WeightPrecision) -> Result<Self> {
         let model = parse_gguf(model_path)?;
         let arch = model.metadata.architecture.clone();
         let eos_id = model.metadata.eos_token_id;
         let tokenizer = build_tokenizer_from_gguf(&model)?;
-        let transformer = TransformerModel::load(&model, device)?;
+        let transformer = TransformerModel::load(&model, device, precision)?;
         Ok(Self {
             transformer,
             tokenizer,

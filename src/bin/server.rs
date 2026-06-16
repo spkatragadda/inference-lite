@@ -20,6 +20,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use candle_core::Device;
 use inference_lite::engine::Engine;
+use inference_lite::forward::WeightPrecision;
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 
@@ -67,8 +68,11 @@ async fn main() -> anyhow::Result<()> {
         .nth(1)
         .unwrap_or_else(|| "./Qwen3-0.6B-Q4_0.gguf".to_string());
 
-    println!("Loading GGUF weights into memory: {model_path}");
-    let engine = Engine::load(&model_path, &device)?;
+    // Weight precision: f16 (faster CPU matmul) by default; set
+    // WEIGHT_DTYPE=quantized to keep the native quantized kernel / smaller RAM.
+    let precision = WeightPrecision::from_env();
+    println!("Loading GGUF weights into memory: {model_path} (weights: {precision:?})");
+    let engine = Engine::load(&model_path, &device, precision)?;
     println!("Loaded model (arch: {}).", engine.arch());
 
     let state = AppState {
