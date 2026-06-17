@@ -18,7 +18,6 @@ use std::io::{self, BufRead, Read, Write};
 use std::net::TcpStream;
 
 use anyhow::{anyhow, Context, Result};
-use serde::Deserialize;
 
 // ANSI styling for a readable transcript. Kept tiny and self-contained.
 const BOLD: &str = "\x1b[1m";
@@ -27,10 +26,9 @@ const CYAN: &str = "\x1b[36m";
 const GREEN: &str = "\x1b[32m";
 const RESET: &str = "\x1b[0m";
 
-/// The server's `/generate` response shape (mirrors `GenerateResp` in server.rs).
-#[derive(Deserialize)]
-struct GenerateResp {
-    text: String,
+/// Summary the streaming client assembles from the final `{"done": ...}` line
+/// of the `/generate/stream` response.
+struct StreamResult {
     prompt_tokens: usize,
     generated_tokens: usize,
     prefill_tps: f64,
@@ -170,27 +168,35 @@ fn main() -> Result<()> {
         })
         .to_string();
 
-        print!("{DIM}…{RESET}\r");
+        // Stream the reply, printing each token the instant the server emits it
+        // so the model's progress is visible during the (slow) decode instead of
+        // a multi-minute hang. `reply` accumulates the full text for the history.
+        print!("{BOLD}{GREEN}bot ▸ {RESET}");
         io::stdout().flush().ok();
 
-        let resp = match http_post_json(&cfg.addr, "/generate", &req_body) {
-            Ok(r) => r,
+        let mut reply = String::new();
+        let result = stream_generate(&cfg.addr, "/generate/stream", &req_body, |delta| {
+            print!("{delta}");
+            io::stdout().flush().ok();
+            reply.push_str(delta);
+        });
+
+        let stats = match result {
+            Ok(s) => s,
             Err(e) => {
                 // Roll back the user turn we optimistically pushed.
                 history.pop();
-                eprintln!("\r{DIM}request failed: {e}{RESET}\n");
+                eprintln!("\n{DIM}request failed: {e}{RESET}\n");
                 continue;
             }
         };
-
-        let reply = resp.text.trim();
-        println!("\r{BOLD}{GREEN}bot ▸ {RESET}{reply}");
+        println!(); // terminate the streamed line
         println!(
             "{DIM}      {} prompt tok · {} gen tok · prefill {:.1} tok/s · decode {:.1} tok/s{RESET}\n",
-            resp.prompt_tokens, resp.generated_tokens, resp.prefill_tps, resp.decode_tps,
+            stats.prompt_tokens, stats.generated_tokens, stats.prefill_tps, stats.decode_tps,
         );
 
-        history.push((Role::Assistant, reply.to_string()));
+        history.push((Role::Assistant, reply.trim().to_string()));
     }
 
     Ok(())
@@ -206,10 +212,12 @@ fn print_help() {
     );
 }
 
-/// Render the conversation into the Qwen3 ChatML template. Matches the
-/// single-turn template `Engine::generate` uses (empty `<think>` block selects
-/// non-thinking mode) and extends it to multiple turns. The string ends with
-/// the assistant prefix so the model continues from there.
+/// Render the conversation into the Qwen2.5 ChatML template, matching the
+/// single-turn template `Engine::generate` uses and extending it to multiple
+/// turns. No `<think>` block is injected: VibeThinker is a reasoning model and
+/// emits its own chain-of-thought, so forcing an empty think block would
+/// suppress it. The string ends with the assistant prefix so the model continues
+/// from there.
 fn render_chatml(system: Option<&str>, history: &[(Role, String)]) -> String {
     let mut out = String::new();
     if let Some(sys) = system {
@@ -221,14 +229,12 @@ fn render_chatml(system: Option<&str>, history: &[(Role, String)]) -> String {
                 out.push_str(&format!("<|im_start|>user\n{content}<|im_end|>\n"));
             }
             Role::Assistant => {
-                out.push_str(&format!(
-                    "<|im_start|>assistant\n<think>\n\n</think>\n\n{content}<|im_end|>\n"
-                ));
+                out.push_str(&format!("<|im_start|>assistant\n{content}<|im_end|>\n"));
             }
         }
     }
     // Open the assistant turn for the model to complete.
-    out.push_str("<|im_start|>assistant\n<think>\n\n</think>\n\n");
+    out.push_str("<|im_start|>assistant\n");
     out
 }
 
@@ -245,17 +251,148 @@ fn http_get(addr: &str, path: &str) -> Result<String> {
     Ok(body)
 }
 
-fn http_post_json(addr: &str, path: &str, json: &str) -> Result<GenerateResp> {
+/// POST to the streaming endpoint and consume the newline-delimited JSON the
+/// server flushes per token. Each `{"token": "..."}` line invokes `on_delta`
+/// immediately (so the caller can print it live); the final `{"done": ...}` line
+/// becomes the returned [`StreamResult`]. Reads the socket incrementally and
+/// decodes HTTP/1.1 chunked transfer encoding by hand (the response body has no
+/// known length), so tokens surface as they arrive rather than after EOF.
+fn stream_generate(
+    addr: &str,
+    path: &str,
+    json: &str,
+    mut on_delta: impl FnMut(&str),
+) -> Result<StreamResult> {
+    let mut stream = TcpStream::connect(addr).with_context(|| format!("connect to {addr}"))?;
     let req = format!(
         "POST {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\n\
          Content-Length: {len}\r\nConnection: close\r\n\r\n{json}",
         len = json.len(),
     );
-    let (status, body) = http_roundtrip(addr, req.as_bytes())?;
-    if status != 200 {
-        return Err(anyhow!("server returned HTTP {status}: {body}"));
+    stream.write_all(req.as_bytes()).context("write request")?;
+
+    let mut buf: Vec<u8> = Vec::new(); // raw bytes not yet parsed
+    let mut tmp = [0u8; 8192];
+    let mut headers_done = false;
+    let mut chunked = false;
+    let mut status = 0u16;
+    let mut line: Vec<u8> = Vec::new(); // current NDJSON line being assembled
+    let mut done: Option<StreamResult> = None;
+    let mut error: Option<String> = None;
+
+    'read: loop {
+        let n = stream.read(&mut tmp).context("read response")?;
+        if n == 0 {
+            break; // server closed the connection (we sent Connection: close)
+        }
+        buf.extend_from_slice(&tmp[..n]);
+
+        // Split headers off once, recording the status and whether the body is
+        // chunked (it always is for our streaming response).
+        if !headers_done {
+            let Some(pos) = find(&buf, b"\r\n\r\n") else {
+                continue; // headers not fully received yet
+            };
+            let head = String::from_utf8_lossy(&buf[..pos]).to_string();
+            status = head
+                .lines()
+                .next()
+                .and_then(|l| l.split_whitespace().nth(1))
+                .and_then(|c| c.parse::<u16>().ok())
+                .unwrap_or(0);
+            chunked = head.lines().any(|l| {
+                let l = l.to_ascii_lowercase();
+                l.starts_with("transfer-encoding:") && l.contains("chunked")
+            });
+            buf.drain(..pos + 4);
+            headers_done = true;
+        }
+
+        // Pull every complete body slice currently buffered, de-chunking if
+        // needed, and feed it through the NDJSON line splitter.
+        loop {
+            let data: Vec<u8> = if chunked {
+                let Some(rn) = find(&buf, b"\r\n") else { break };
+                let size = std::str::from_utf8(&buf[..rn])
+                    .ok()
+                    .and_then(|s| usize::from_str_radix(s.trim(), 16).ok())
+                    .ok_or_else(|| anyhow!("malformed chunk size"))?;
+                if size == 0 {
+                    break 'read; // terminating zero-length chunk
+                }
+                let need = rn + 2 + size + 2; // size line + data + trailing CRLF
+                if buf.len() < need {
+                    break; // wait for the rest of this chunk
+                }
+                let data = buf[rn + 2..rn + 2 + size].to_vec();
+                buf.drain(..need);
+                data
+            } else if buf.is_empty() {
+                break;
+            } else {
+                std::mem::take(&mut buf)
+            };
+
+            // '\n' never appears mid-UTF-8 and token text is JSON-escaped, so a
+            // raw '\n' always terminates a complete NDJSON object.
+            for b in data {
+                if b == b'\n' {
+                    handle_line(&line, &mut on_delta, &mut done, &mut error)?;
+                    line.clear();
+                } else {
+                    line.push(b);
+                }
+            }
+        }
     }
-    serde_json::from_str(&body).with_context(|| format!("invalid JSON response: {body}"))
+
+    if status != 0 && status != 200 {
+        return Err(anyhow!(
+            "server returned HTTP {status}: {}",
+            String::from_utf8_lossy(&line)
+        ));
+    }
+    if let Some(e) = error {
+        return Err(anyhow!(e));
+    }
+    done.ok_or_else(|| anyhow!("stream ended without a 'done' summary"))
+}
+
+/// Parse one NDJSON line from the stream and dispatch it: a token is forwarded
+/// to `on_delta`, the `done` summary is captured, an `error` is recorded.
+fn handle_line(
+    line: &[u8],
+    on_delta: &mut impl FnMut(&str),
+    done: &mut Option<StreamResult>,
+    error: &mut Option<String>,
+) -> Result<()> {
+    let line = line.trim_ascii();
+    if line.is_empty() {
+        return Ok(());
+    }
+    let v: serde_json::Value = serde_json::from_slice(line)
+        .with_context(|| format!("invalid NDJSON line: {}", String::from_utf8_lossy(line)))?;
+
+    if let Some(t) = v.get("token").and_then(|t| t.as_str()) {
+        on_delta(t);
+    } else if v.get("done").and_then(|d| d.as_bool()) == Some(true) {
+        let num = |k: &str| v.get(k).and_then(|x| x.as_u64()).unwrap_or(0) as usize;
+        let tps = |k: &str| v.get(k).and_then(|x| x.as_f64()).unwrap_or(0.0);
+        *done = Some(StreamResult {
+            prompt_tokens: num("prompt_tokens"),
+            generated_tokens: num("generated_tokens"),
+            prefill_tps: tps("prefill_tps"),
+            decode_tps: tps("decode_tps"),
+        });
+    } else if let Some(e) = v.get("error").and_then(|e| e.as_str()) {
+        *error = Some(e.to_string());
+    }
+    Ok(())
+}
+
+/// First index of `needle` within `haystack`, if present.
+fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).position(|w| w == needle)
 }
 
 /// Send a raw request, read the whole response, and return (status_code, body).

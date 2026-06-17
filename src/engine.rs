@@ -79,12 +79,11 @@ impl Engine {
         mut on_token: impl FnMut(&str),
     ) -> Result<GenOutput> {
         let input = if chat_template {
-            // Instruct template; the trailing empty <think> block selects
-            // non-thinking mode so small models answer directly.
-            format!(
-                "<|im_start|>user\n{prompt}<|im_end|>\n\
-                 <|im_start|>assistant\n<think>\n\n</think>\n\n"
-            )
+            // Plain Qwen2.5 ChatML template (no forced <think> block). VibeThinker
+            // is a reasoning model built on Qwen2.5-Math; it emits its own
+            // chain-of-thought, so injecting an empty think block would suppress
+            // the reasoning this model exists to produce.
+            format!("<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n")
         } else {
             prompt.to_string()
         };

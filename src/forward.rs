@@ -38,7 +38,13 @@ use crate::gguf_parser::{InferenceModel, NamedTensor};
 /// advertise a far larger `context_length` (Qwen3-0.6B reports 40960), which we
 /// clamp to this. Growing past it is the job of the paged BlockManager; for now
 /// we trade a fixed window for zero-allocation decoding.
-const MAX_SEQ_LEN: usize = 4096;
+///
+/// Sized for reasoning models (VibeThinker-1.5B): chain-of-thought traces run to
+/// many thousands of tokens, and hitting this cap triggers StreamingLLM eviction
+/// that drops the middle of the reasoning chain. KV cost is linear in this value
+/// (`n_layers * 2 * n_kv_heads * MAX_SEQ_LEN * head_dim * 4 bytes` ~= 1.8 GB for
+/// the 1.5B at 16384), so raise/lower it against available RAM.
+const MAX_SEQ_LEN: usize = 16384;
 
 /// StreamingLLM (attention-sink) parameters. When the cache fills, the first
 /// `DEFAULT_N_SINK` tokens are kept as permanent "sinks" and the oldest recent
