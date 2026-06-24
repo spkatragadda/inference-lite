@@ -106,8 +106,21 @@ impl Engine {
         let prefill_secs = prefill_start.elapsed().as_secs_f64();
 
         // Greedy decode loop.
+        //
+        // Incremental detokenization: rather than re-decoding the whole sequence
+        // every step (O(N) per token -> O(N^2) over a generation, which on the
+        // multi-thousand-token reasoning traces this model produces is real CPU
+        // cost serialized into the decode loop), we decode only the
+        // not-yet-emitted tail. `pending` holds the tokens whose bytes haven't
+        // formed a complete UTF-8 string yet. The byte-level BPE decoder maps
+        // each token to raw bytes and concatenates them with no cross-token
+        // contextual stripping, so decode(tail) is exactly the corresponding
+        // byte-slice of the full decode — provided we only ever split on a valid
+        // UTF-8 boundary. We hold a chunk back whenever it ends mid-multi-byte
+        // char (trailing U+FFFD) and flush it once the next token completes it.
         let mut generated: Vec<u32> = Vec::with_capacity(max_new_tokens);
-        let mut printed_bytes = 0usize;
+        let mut pending: Vec<u32> = Vec::new();
+        let mut text = String::new();
         let decode_start = Instant::now();
         for _ in 0..max_new_tokens {
             let next = argmax_last_dim(&logits)?;
@@ -115,29 +128,37 @@ impl Engine {
                 break;
             }
             generated.push(next);
+            pending.push(next);
 
-            // Re-decode the whole sequence and emit only the new, complete
-            // suffix (skip deltas ending on a partial multi-byte char).
-            let decoded = self
+            let chunk = self
                 .tokenizer
-                .decode(&generated, true)
+                .decode(&pending, true)
                 .map_err(|e| anyhow::anyhow!("tokenizer decode failed: {e}"))?;
-            if decoded.len() > printed_bytes && !decoded.ends_with('\u{FFFD}') {
-                on_token(&decoded[printed_bytes..]);
-                printed_bytes = decoded.len();
+            // Emit only once the pending tokens decode to a complete string:
+            // non-empty and not ending on a partial multi-byte char. Skipped
+            // special tokens decode to "" and simply stay in `pending` until a
+            // real token follows — harmless, as they contribute no bytes.
+            if !chunk.is_empty() && !chunk.ends_with('\u{FFFD}') {
+                on_token(&chunk);
+                text.push_str(&chunk);
+                pending.clear();
             }
 
             logits = self.transformer.forward(next)?;
         }
         let decode_secs = decode_start.elapsed().as_secs_f64();
 
-        // Final flush of any bytes held back for UTF-8 boundary safety.
-        let text = self
-            .tokenizer
-            .decode(&generated, true)
-            .map_err(|e| anyhow::anyhow!("tokenizer decode failed: {e}"))?;
-        if text.len() > printed_bytes {
-            on_token(&text[printed_bytes..]);
+        // Final flush: emit any bytes still held back for UTF-8 boundary safety
+        // (an unfinished multi-byte char at the EOS / length cutoff).
+        if !pending.is_empty() {
+            let tail = self
+                .tokenizer
+                .decode(&pending, true)
+                .map_err(|e| anyhow::anyhow!("tokenizer decode failed: {e}"))?;
+            if !tail.is_empty() {
+                on_token(&tail);
+                text.push_str(&tail);
+            }
         }
 
         Ok(GenOutput {
