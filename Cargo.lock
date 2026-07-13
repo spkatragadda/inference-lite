@@ -757,6 +757,7 @@ dependencies = [
  "anyhow",
  "axum",
  "candle-core",
+ "half",
  "rayon",
  "serde",
  "serde_json",

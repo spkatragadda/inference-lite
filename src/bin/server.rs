@@ -58,6 +58,9 @@ fn default_chat_template() -> bool {
 struct GenerateResp {
     text: String,
     prompt_tokens: usize,
+    /// Prompt tokens whose K/V was reused from the previous request's cache
+    /// (prefix caching); only `prompt_tokens - reused_tokens` were prefilled.
+    reused_tokens: usize,
     generated_tokens: usize,
     prefill_tps: f64,
     decode_tps: f64,
@@ -128,8 +131,13 @@ async fn generate(
     Ok(Json(GenerateResp {
         text: result.text,
         prompt_tokens: result.prompt_tokens,
+        reused_tokens: result.reused_tokens,
         generated_tokens: result.generated_tokens,
-        prefill_tps: throughput(result.prompt_tokens, result.prefill_secs),
+        // Throughput over the tokens actually prefilled (reused ones cost ~0).
+        prefill_tps: throughput(
+            result.prompt_tokens - result.reused_tokens,
+            result.prefill_secs,
+        ),
         decode_tps: throughput(result.generated_tokens, result.decode_secs),
     }))
 }
@@ -161,8 +169,10 @@ async fn generate_stream(State(state): State<AppState>, Json(req): Json<Generate
             Ok(out) => serde_json::json!({
                 "done": true,
                 "prompt_tokens": out.prompt_tokens,
+                "reused_tokens": out.reused_tokens,
                 "generated_tokens": out.generated_tokens,
-                "prefill_tps": throughput(out.prompt_tokens, out.prefill_secs),
+                // Throughput over the tokens actually prefilled (reused ~0 cost).
+                "prefill_tps": throughput(out.prompt_tokens - out.reused_tokens, out.prefill_secs),
                 "decode_tps": throughput(out.generated_tokens, out.decode_secs),
             }),
             Err(e) => serde_json::json!({ "error": format!("generation failed: {e}") }),

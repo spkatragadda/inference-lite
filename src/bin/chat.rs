@@ -30,6 +30,8 @@ const RESET: &str = "\x1b[0m";
 /// of the `/generate/stream` response.
 struct StreamResult {
     prompt_tokens: usize,
+    /// Prompt tokens served from the server's prefix cache (not re-prefilled).
+    reused_tokens: usize,
     generated_tokens: usize,
     prefill_tps: f64,
     decode_tps: f64,
@@ -192,8 +194,12 @@ fn main() -> Result<()> {
         };
         println!(); // terminate the streamed line
         println!(
-            "{DIM}      {} prompt tok · {} gen tok · prefill {:.1} tok/s · decode {:.1} tok/s{RESET}\n",
-            stats.prompt_tokens, stats.generated_tokens, stats.prefill_tps, stats.decode_tps,
+            "{DIM}      {} prompt tok ({} cached) · {} gen tok · prefill {:.1} tok/s · decode {:.1} tok/s{RESET}\n",
+            stats.prompt_tokens,
+            stats.reused_tokens,
+            stats.generated_tokens,
+            stats.prefill_tps,
+            stats.decode_tps,
         );
 
         history.push((Role::Assistant, reply.trim().to_string()));
@@ -380,6 +386,7 @@ fn handle_line(
         let tps = |k: &str| v.get(k).and_then(|x| x.as_f64()).unwrap_or(0.0);
         *done = Some(StreamResult {
             prompt_tokens: num("prompt_tokens"),
+            reused_tokens: num("reused_tokens"),
             generated_tokens: num("generated_tokens"),
             prefill_tps: tps("prefill_tps"),
             decode_tps: tps("decode_tps"),

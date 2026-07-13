@@ -23,11 +23,12 @@
 //! Plus globals: token_embd.weight, output_norm.weight, output.weight
 //! (output.weight may be absent if tied to token_embd).
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 
 use anyhow::{anyhow, bail, Context};
 use candle_core::quantized::{gguf_file, QMatMul};
-use candle_core::{DType, Device, Module, Tensor, D};
+use candle_core::{CpuStorage, DType, Device, Module, Storage, Tensor, D};
+use half::f16;
 use rayon::prelude::*;
 
 use crate::gguf_parser::{InferenceModel, NamedTensor};
@@ -116,16 +117,29 @@ enum QkvProjection {
     },
 }
 
-/// One layer's KV cache: two flat, padded f32 buffers laid out
+/// FFN gate/up projections. SwiGLU needs `gate = Wg·h` and `up = Wu·h`; stacking
+/// `[Wg; Wu]` into one `[2*ffn, hidden]` weight runs a single larger GEMM (better
+/// cache blocking + threading + fewer kernel launches) and splits the output into
+/// the gate||up halves. Only the F16 path can fuse — candle can't `cat` quantized
+/// blocks — so the quantized path keeps the two separate matmuls.
+enum GateUp {
+    Fused(QMatMul),
+    Split { gate: QMatMul, up: QMatMul },
+}
+
+/// One layer's KV cache: two flat, padded **f16** buffers laid out
 /// `[n_kv_heads, max_seq, head_dim]` row-major. The new chunk's K/V is written
 /// in place at the current position (an O(q_len) scatter, no reallocation), and
 /// the attention kernel reads these buffers *directly* with the right strides —
-/// no copy of the prior history out of the cache each decode step. `RefCell`
-/// gives the interior mutability the write needs behind the `&self` forward
-/// pass; reads borrow immutably for the duration of the kernel.
+/// no copy of the prior history out of the cache each decode step. Storing K/V
+/// at half precision halves both the cache RAM and the per-token attention read
+/// bandwidth (the SDPA inner loop streams the whole prefix every decode step);
+/// values are upconverted to f32 on read (cheap with F16C) and the dot products
+/// still accumulate in f32. `RefCell` gives the interior mutability the write
+/// needs behind the `&self` forward pass; reads borrow immutably for the kernel.
 struct KvLayer {
-    k: RefCell<Vec<f32>>,
-    v: RefCell<Vec<f32>>,
+    k: RefCell<Vec<f16>>,
+    v: RefCell<Vec<f16>>,
 }
 
 /// One transformer block's worth of weights, in QMatMul / Tensor form.
@@ -138,8 +152,7 @@ struct Block {
     q_head_norm: Option<Tensor>,
     k_head_norm: Option<Tensor>,
     ffn_norm: Tensor,
-    gate_proj: QMatMul,
-    up_proj: QMatMul,
+    gate_up: GateUp,
     down_proj: QMatMul,
 }
 
@@ -157,7 +170,7 @@ pub struct TransformerModel {
     rms_eps: f64,
     vocab_size: usize,
     // Preallocated per-layer KV cache, one `KvLayer` per block. Each holds flat
-    // f32 buffers of shape [n_kv_heads, max_seq, head_dim]. The new token's K/V
+    // f16 buffers of shape [n_kv_heads, max_seq, head_dim]. The new token's K/V
     // is written at slot `position` in place, and the fused attention kernel
     // reads these buffers *directly* via strides — no per-step copy of the
     // history out of the cache, and no `.contiguous()`. This replaces both the
@@ -181,6 +194,16 @@ pub struct TransformerModel {
     // `n_sink` tokens are never evicted.
     n_sink: usize,
     enable_streaming: bool,
+    // Prefix cache bookkeeping: the token ids whose K/V currently occupy slots
+    // [0..position], in order (invariant: `cache_tokens.len() == position` while
+    // `prefix_valid`). [`Self::reuse_prefix`] uses this to keep the shared
+    // prefix of consecutive chat-turn prompts instead of re-prefilling the whole
+    // transcript every turn. StreamingLLM eviction drops tokens from the
+    // *middle*, after which slots no longer correspond to any contiguous token
+    // prefix — eviction therefore sets `prefix_valid = false`, and the next
+    // request falls back to a full prefill.
+    cache_tokens: RefCell<Vec<u32>>,
+    prefix_valid: Cell<bool>,
 }
 
 impl TransformerModel {
@@ -190,6 +213,39 @@ impl TransformerModel {
         // 0.. as it goes and reads never look past `position`, so any stale
         // data beyond it is never observed. No need to zero the buffers.
         *self.position.borrow_mut() = 0;
+        self.cache_tokens.borrow_mut().clear();
+        self.prefix_valid.set(true);
+    }
+
+    /// Prefix-cache reuse: keep the K/V already computed for the longest common
+    /// prefix between `prompt` and the tokens currently in the cache, and roll
+    /// `position` back to just past it. Returns how many prompt tokens were
+    /// reused; the caller prefills only `prompt[reused..]`.
+    ///
+    /// In a chat session each turn's prompt is the previous transcript plus the
+    /// new user message, so the common prefix is nearly the whole prompt — this
+    /// turns the per-turn prefill from O(transcript) into O(new turn).
+    ///
+    /// The reuse count is capped at `prompt.len() - 1`: the last token must
+    /// always be forwarded so there are logits to sample from (and an identical
+    /// re-request then recomputes exactly one token). If eviction has ever
+    /// compacted the cache (`prefix_valid == false`), slots no longer correspond
+    /// to a contiguous token prefix, so we do a full reset and return 0.
+    pub fn reuse_prefix(&self, prompt: &[u32]) -> usize {
+        if !self.prefix_valid.get() || prompt.is_empty() {
+            self.reset_state();
+            return 0;
+        }
+        let mut cached = self.cache_tokens.borrow_mut();
+        let reused = cached
+            .iter()
+            .zip(prompt)
+            .take_while(|(a, b)| a == b)
+            .count()
+            .min(prompt.len() - 1);
+        cached.truncate(reused);
+        *self.position.borrow_mut() = reused;
+        reused
     }
 
     /// Build the model from a parsed GGUF. Hyperparameters come from
@@ -252,7 +308,7 @@ impl TransformerModel {
         }
 
         // Preallocate the fixed-size KV buffers, one KvLayer per block. Each
-        // buffer is a flat [n_kv_heads * max_seq * head_dim] f32 vec.
+        // buffer is a flat [n_kv_heads * max_seq * head_dim] f16 vec.
         let max_seq = (meta.context_length as usize).clamp(1, MAX_SEQ_LEN);
 
         // StreamingLLM config. Streaming is on by default; n_sink is clamped so
@@ -267,8 +323,8 @@ impl TransformerModel {
         let mut kv_cache = Vec::with_capacity(n_blocks);
         for _ in 0..n_blocks {
             kv_cache.push(KvLayer {
-                k: RefCell::new(vec![0f32; layer_elems]),
-                v: RefCell::new(vec![0f32; layer_elems]),
+                k: RefCell::new(vec![f16::ZERO; layer_elems]),
+                v: RefCell::new(vec![f16::ZERO; layer_elems]),
             });
         }
 
@@ -291,6 +347,8 @@ impl TransformerModel {
             position: RefCell::new(0),
             n_sink,
             enable_streaming,
+            cache_tokens: RefCell::new(Vec::new()),
+            prefix_valid: Cell::new(true),
         })
     }
 
@@ -332,6 +390,7 @@ impl TransformerModel {
             }
             let last = self.run_chunk(token_ids, pos0)?;
             *self.position.borrow_mut() = pos0 + total;
+            self.record_tokens(token_ids);
             return self.finish_logits(&last);
         }
 
@@ -351,10 +410,21 @@ impl TransformerModel {
             let sub = &token_ids[offset..offset + take];
             last_hidden = Some(self.run_chunk(sub, pos0)?);
             *self.position.borrow_mut() = pos0 + take;
+            self.record_tokens(sub);
             offset += take;
         }
 
         self.finish_logits(&last_hidden.expect("at least one sub-chunk runs"))
+    }
+
+    /// Append just-processed token ids to the prefix-cache log, keeping
+    /// `cache_tokens` aligned with the K/V now in slots [0..position]. A no-op
+    /// once eviction has invalidated reuse (the log would no longer describe
+    /// the slots).
+    fn record_tokens(&self, token_ids: &[u32]) {
+        if self.prefix_valid.get() {
+            self.cache_tokens.borrow_mut().extend_from_slice(token_ids);
+        }
     }
 
     /// Embedding lookup + all transformer blocks for one sub-chunk whose tokens
@@ -432,6 +502,11 @@ impl TransformerModel {
             evict_values(&mut v, self.n_kv_heads, self.head_dim, self.max_seq, self.n_sink, used, evict);
         }
         *self.position.borrow_mut() = used - evict;
+        // Eviction drops tokens from the middle of the sequence: the surviving
+        // slots no longer correspond to any contiguous prompt prefix, so prefix
+        // reuse is off until the next full reset.
+        self.prefix_valid.set(false);
+        self.cache_tokens.borrow_mut().clear();
         Ok(())
     }
 
@@ -530,22 +605,27 @@ impl TransformerModel {
         // `max_seq * head_dim`, per-position stride is `head_dim`. Only the
         // [0..pos0+q_len) prefix of each head is populated, and the kernel's
         // causal bound never reads past it.
-        let q_vec = q.flatten_all()?.to_vec1::<f32>()?;
         let kv = &self.kv_cache[layer_idx];
         let k_buf = kv.k.borrow();
         let v_buf = kv.v.borrow();
-        let out = fused_sdpa(
-            &q_vec,
-            &k_buf,
-            &v_buf,
-            self.n_heads,
-            self.n_kv_heads,
-            self.head_dim,
-            q_len,
-            pos0,
-            self.max_seq * self.head_dim,
-            self.head_dim,
-        );
+        // Q is read straight from its (contiguous) tensor storage — no copy out
+        // to a temporary Vec each layer/token. K/V are likewise read in place
+        // from the cache buffers, which live as flat f16 Vecs (upconverted to
+        // f32 per element inside the kernel).
+        let out = with_f32_slice(&q, |q_vec| {
+            fused_sdpa(
+                q_vec,
+                &k_buf,
+                &v_buf,
+                self.n_heads,
+                self.n_kv_heads,
+                self.head_dim,
+                q_len,
+                pos0,
+                self.max_seq * self.head_dim,
+                self.head_dim,
+            )
+        })?;
         let attn = Tensor::from_vec(out, (1, self.n_heads, q_len, self.head_dim), &self.device)?;
 
         // Merge heads back: [1, q_len, hidden]
@@ -560,8 +640,20 @@ impl TransformerModel {
         // ---- FFN sub-block (SwiGLU) ----
         let residual = x.clone();
         let h = rms_norm(&x, &block.ffn_norm, self.rms_eps)?;
-        let gate = block.gate_proj.forward(&h)?;
-        let up = block.up_proj.forward(&h)?;
+        // gate/up: one fused GEMM split into halves (F16), or two matmuls
+        // (quantized). The fused weight stacks [Wg; Wu], so gate is the first
+        // `ffn` output columns and up is the second.
+        let (gate, up) = match &block.gate_up {
+            GateUp::Fused(w) => {
+                let gu = w.forward(&h)?;
+                let ffn = gu.dim(D::Minus1)? / 2;
+                (
+                    gu.narrow(D::Minus1, 0, ffn)?.contiguous()?,
+                    gu.narrow(D::Minus1, ffn, ffn)?.contiguous()?,
+                )
+            }
+            GateUp::Split { gate, up } => (gate.forward(&h)?, up.forward(&h)?),
+        };
         let gated = silu(&gate)?.mul(&up)?;
         let ffn_out = block.down_proj.forward(&gated)?;
         let r = (residual + ffn_out)?;
@@ -599,21 +691,37 @@ impl TransformerModel {
         let dst_head_stride = self.max_seq * head_dim;
         let src_head_stride = q_len * head_dim;
 
-        let k_src = k_new.flatten_all()?.to_vec1::<f32>()?;
-        let v_src = v_new.flatten_all()?.to_vec1::<f32>()?;
-
         let kv = &self.kv_cache[layer_idx];
         let mut k_buf = kv.k.borrow_mut();
         let mut v_buf = kv.v.borrow_mut();
 
-        for h in 0..self.n_kv_heads {
-            for j in 0..q_len {
-                let dst = h * dst_head_stride + (pos0 + j) * head_dim;
-                let src = h * src_head_stride + j * head_dim;
-                k_buf[dst..dst + row].copy_from_slice(&k_src[src..src + row]);
-                v_buf[dst..dst + row].copy_from_slice(&v_src[src..src + row]);
+        // Scatter directly from each tensor's (contiguous) f32 storage into the
+        // cache, downconverting to f16 per element (no intermediate `to_vec1`
+        // copy). K and V are scattered in separate passes so only one storage
+        // read-guard is held at a time; the row writes are identical, just into
+        // different destination buffers.
+        with_f32_slice(k_new, |k_src| {
+            for h in 0..self.n_kv_heads {
+                for j in 0..q_len {
+                    let dst = h * dst_head_stride + (pos0 + j) * head_dim;
+                    let src = h * src_head_stride + j * head_dim;
+                    for d in 0..row {
+                        k_buf[dst + d] = f16::from_f32(k_src[src + d]);
+                    }
+                }
             }
-        }
+        })?;
+        with_f32_slice(v_new, |v_src| {
+            for h in 0..self.n_kv_heads {
+                for j in 0..q_len {
+                    let dst = h * dst_head_stride + (pos0 + j) * head_dim;
+                    let src = h * src_head_stride + j * head_dim;
+                    for d in 0..row {
+                        v_buf[dst + d] = f16::from_f32(v_src[src + d]);
+                    }
+                }
+            }
+        })?;
         Ok(())
     }
 }
@@ -692,10 +800,29 @@ fn load_block(
         q_head_norm: optional_norm(model, &format!("{p}.attn_q_norm.weight"), device)?,
         k_head_norm: optional_norm(model, &format!("{p}.attn_k_norm.weight"), device)?,
         ffn_norm,
-        gate_proj: qmatmul(model, &format!("{p}.ffn_gate.weight"), precision, device)?,
-        up_proj: qmatmul(model, &format!("{p}.ffn_up.weight"), precision, device)?,
+        gate_up: build_gate_up(model, &p, device, precision)?,
         down_proj: qmatmul(model, &format!("{p}.ffn_down.weight"), precision, device)?,
     })
+}
+
+/// Build the FFN gate/up projection: one fused `[2*ffn, hidden]` GEMM on the F16
+/// path (output split into gate||up), or two separate matmuls on the quantized
+/// path (candle can't `cat` quantized blocks).
+fn build_gate_up(
+    model: &InferenceModel,
+    p: &str,
+    device: &Device,
+    precision: WeightPrecision,
+) -> anyhow::Result<GateUp> {
+    let gate = qmatmul(model, &format!("{p}.ffn_gate.weight"), precision, device)?;
+    let up = qmatmul(model, &format!("{p}.ffn_up.weight"), precision, device)?;
+    if precision == WeightPrecision::F16 {
+        let fused = cat_f16_weights(&[&gate, &up])
+            .map_err(|e| anyhow!("fusing gate/up for {p}: {e}"))?;
+        Ok(GateUp::Fused(fused))
+    } else {
+        Ok(GateUp::Split { gate, up })
+    }
 }
 
 /// Pick between fused (`attn_qkv.weight`) and split (`attn_q/k/v.weight`)
@@ -723,13 +850,34 @@ fn build_qkv_projection(
         .iter()
         .all(|s| model.tensors.contains_key(&format!("{p}.{s}")));
     if has_split {
+        let q = qmatmul(model, &format!("{p}.attn_q.weight"), precision, device)?;
+        let k = qmatmul(model, &format!("{p}.attn_k.weight"), precision, device)?;
+        let v = qmatmul(model, &format!("{p}.attn_v.weight"), precision, device)?;
+        let q_bias = optional_bias(model, &format!("{p}.attn_q.bias"), device)?;
+        let k_bias = optional_bias(model, &format!("{p}.attn_k.bias"), device)?;
+        let v_bias = optional_bias(model, &format!("{p}.attn_v.bias"), device)?;
+
+        // On the F16 path, fuse the three projections into one GEMM. The fused
+        // weight stacks rows [q; k; v], so the existing `Fused` runtime narrow
+        // recovers q_dim / kv_dim / kv_dim from the output in that order. Biases
+        // are concatenated the same way (zeros filled in for any absent piece so
+        // the widths line up). The quantized path keeps three matmuls — candle
+        // can't `cat` quantized blocks.
+        if precision == WeightPrecision::F16 {
+            let qkv = cat_f16_weights(&[&q, &k, &v])
+                .map_err(|e| anyhow!("fusing QKV for {p}: {e}"))?;
+            let dims = [out_dim(&q)?, out_dim(&k)?, out_dim(&v)?];
+            let bias = cat_biases(&[q_bias, k_bias, v_bias], &dims, device)?;
+            return Ok(QkvProjection::Fused { qkv, bias });
+        }
+
         return Ok(QkvProjection::Split {
-            q: qmatmul(model, &format!("{p}.attn_q.weight"), precision, device)?,
-            k: qmatmul(model, &format!("{p}.attn_k.weight"), precision, device)?,
-            v: qmatmul(model, &format!("{p}.attn_v.weight"), precision, device)?,
-            q_bias: optional_bias(model, &format!("{p}.attn_q.bias"), device)?,
-            k_bias: optional_bias(model, &format!("{p}.attn_k.bias"), device)?,
-            v_bias: optional_bias(model, &format!("{p}.attn_v.bias"), device)?,
+            q,
+            k,
+            v,
+            q_bias,
+            k_bias,
+            v_bias,
         });
     }
 
@@ -758,6 +906,72 @@ fn build_qkv_projection(
 }
 
 // ---------- small helpers ----------
+
+/// Concatenate several linear weights along the output-feature axis (dim 0) into
+/// one fused f16 weight, so a block can run a single larger GEMM instead of N
+/// small ones. Each part is taken as its dequantized f16 tensor (cheap clone for
+/// already-f16 weights); the result is wrapped as `QMatMul::TensorF16`. Caller
+/// must guarantee the F16 path — candle has no `cat` for quantized blocks.
+fn cat_f16_weights(parts: &[&QMatMul]) -> anyhow::Result<QMatMul> {
+    let tensors = parts
+        .iter()
+        .map(|w| w.dequantize_f16())
+        .collect::<candle_core::Result<Vec<Tensor>>>()?;
+    let refs: Vec<&Tensor> = tensors.iter().collect();
+    Ok(QMatMul::TensorF16(Tensor::cat(&refs, 0)?.contiguous()?))
+}
+
+/// Output-feature count (rows) of a linear weight, read from its f16 form.
+fn out_dim(w: &QMatMul) -> anyhow::Result<usize> {
+    Ok(w.dequantize_f16()?.dim(0)?)
+}
+
+/// Concatenate per-projection bias vectors (in the same order their weights were
+/// fused) into one bias for the fused GEMM. Returns `None` if every part is
+/// absent; otherwise any missing piece is filled with zeros of its weight's
+/// output width so the concatenated bias matches the fused output.
+fn cat_biases(
+    biases: &[Option<Tensor>],
+    dims: &[usize],
+    device: &Device,
+) -> anyhow::Result<Option<Tensor>> {
+    if biases.iter().all(Option::is_none) {
+        return Ok(None);
+    }
+    let mut parts = Vec::with_capacity(biases.len());
+    for (b, &d) in biases.iter().zip(dims) {
+        parts.push(match b {
+            Some(t) => t.clone(),
+            None => Tensor::zeros(d, DType::F32, device)?,
+        });
+    }
+    let refs: Vec<&Tensor> = parts.iter().collect();
+    Ok(Some(Tensor::cat(&refs, 0)?))
+}
+
+/// Borrow a contiguous CPU **f32** tensor's backing storage as a `&[f32]` with
+/// no copy and run `f` on it. The slice borrows the storage read-guard, so the
+/// access is scoped to the closure rather than returned — that's why this is a
+/// `with_*` combinator and not a plain getter (you can't return a reference into
+/// a guard you also move out). It replaces `t.flatten_all()?.to_vec1::<f32>()?`,
+/// which allocated + memcpy'd the whole tensor every layer/token. The Q/K/V
+/// tensors we pass here are all built with a trailing `.contiguous()`, so the
+/// contiguous f32 path is the expected one; a strided view, non-f32 dtype, or
+/// GPU storage would be a caller bug, so we bail loudly rather than silently
+/// mis-read.
+fn with_f32_slice<R>(t: &Tensor, f: impl FnOnce(&[f32]) -> R) -> anyhow::Result<R> {
+    let (storage, layout) = t.storage_and_layout();
+    match &*storage {
+        Storage::Cpu(CpuStorage::F32(buf)) if layout.is_contiguous() => {
+            let start = layout.start_offset();
+            Ok(f(&buf[start..start + layout.shape().elem_count()]))
+        }
+        Storage::Cpu(CpuStorage::F32(_)) => {
+            bail!("with_f32_slice: f32 tensor is not contiguous (start_offset/strided view)")
+        }
+        _ => bail!("with_f32_slice: expected a contiguous CPU f32 tensor"),
+    }
+}
 
 fn get_tensor<'a>(model: &'a InferenceModel, name: &str) -> anyhow::Result<&'a NamedTensor> {
     model
@@ -955,7 +1169,7 @@ fn build_rope_tables(
 /// clobbered.
 #[allow(clippy::too_many_arguments)]
 fn evict_and_rotate_keys(
-    k_buf: &mut [f32],
+    k_buf: &mut [f16],
     n_kv_heads: usize,
     head_dim: usize,
     max_seq: usize,
@@ -973,12 +1187,13 @@ fn evict_and_rotate_keys(
             let src = base + slot * head_dim;
             let dst = base + (slot - evict) * head_dim;
             for d in 0..half {
-                let a = k_buf[src + d];
-                let b = k_buf[src + half + d];
+                // Upconvert, rotate in f32, store back as f16.
+                let a = k_buf[src + d].to_f32();
+                let b = k_buf[src + half + d].to_f32();
                 let c = cos_e[d];
                 let s = sin_e[d];
-                k_buf[dst + d] = a * c + b * s;
-                k_buf[dst + half + d] = -a * s + b * c;
+                k_buf[dst + d] = f16::from_f32(a * c + b * s);
+                k_buf[dst + half + d] = f16::from_f32(-a * s + b * c);
             }
         }
     }
@@ -989,7 +1204,7 @@ fn evict_and_rotate_keys(
 /// contiguous, so it moves in one `copy_within` (memmove semantics handle the
 /// overlap) rather than slot by slot.
 fn evict_values(
-    v_buf: &mut [f32],
+    v_buf: &mut [f16],
     n_kv_heads: usize,
     head_dim: usize,
     max_seq: usize,
@@ -1012,7 +1227,8 @@ fn evict_values(
 /// One pass over the KV prefix per `(head, query row)`: never materializes the
 /// `[n_heads, q_len, kv_len]` score matrix, never repeats KV heads (Q→KV head
 /// mapping is done by index), and keeps softmax numerically stable via a
-/// running max + running denominator. All f32, CPU.
+/// running max + running denominator. Q is f32; the cached K/V are f16,
+/// upconverted per element on read; all accumulation is f32. CPU.
 ///
 /// Row-major indexing (the caller passes the strides so this works on either a
 /// tight contiguous prefix or a padded buffer read in place):
@@ -1024,8 +1240,8 @@ fn evict_values(
 #[allow(clippy::too_many_arguments)]
 fn fused_sdpa(
     q: &[f32],
-    k: &[f32],
-    v: &[f32],
+    k: &[f16],
+    v: &[f16],
     n_heads: usize,
     n_kv_heads: usize,
     head_dim: usize,
@@ -1058,7 +1274,7 @@ fn fused_sdpa(
                 let k_row = &k[off..off + head_dim];
                 let mut s = 0f32;
                 for d in 0..head_dim {
-                    s += q_row[d] * k_row[d];
+                    s += q_row[d] * k_row[d].to_f32();
                 }
                 s /= scale;
 
@@ -1072,7 +1288,7 @@ fn fused_sdpa(
                 l = l * corr + p;
                 let v_row = &v[off..off + head_dim];
                 for d in 0..head_dim {
-                    acc[d] = acc[d] * corr + p * v_row[d];
+                    acc[d] = acc[d] * corr + p * v_row[d].to_f32();
                 }
                 m = new_m;
             }
@@ -1177,14 +1393,35 @@ mod tests {
         let q = Tensor::rand(-1f32, 1f32, (1, n_heads, q_len, head_dim), &device).unwrap();
         let k = Tensor::rand(-1f32, 1f32, (1, n_kv_heads, kv_len, head_dim), &device).unwrap();
         let v = Tensor::rand(-1f32, 1f32, (1, n_kv_heads, kv_len, head_dim), &device).unwrap();
+        // The real cache stores K/V in f16. Round the reference inputs to f16 too
+        // (Q stays f32, as in the live path) so the fused kernel and the dense
+        // reference see *identical* numbers — keeping this a check of the
+        // online-softmax math, not a measurement of f16 rounding error.
+        let to_f16_f32 = |t: &Tensor| {
+            t.to_dtype(DType::F16)
+                .unwrap()
+                .to_dtype(DType::F32)
+                .unwrap()
+        };
+        let k = to_f16_f32(&k);
+        let v = to_f16_f32(&v);
 
         let reference =
             reference_attention(&q, &k, &v, n_heads, n_kv_heads, head_dim, q_len, kv_len, pos0);
         let ref_vec = reference.flatten_all().unwrap().to_vec1::<f32>().unwrap();
 
+        let to_f16_vec = |t: &Tensor| -> Vec<f16> {
+            t.flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
+                .iter()
+                .map(|&x| f16::from_f32(x))
+                .collect()
+        };
         let q_vec = q.flatten_all().unwrap().to_vec1::<f32>().unwrap();
-        let k_vec = k.flatten_all().unwrap().to_vec1::<f32>().unwrap();
-        let v_vec = v.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let k_vec = to_f16_vec(&k); // exact: k is already f16-representable
+        let v_vec = to_f16_vec(&v);
         let fused = fused_sdpa(
             &q_vec,
             &k_vec,
@@ -1204,8 +1441,10 @@ mod tests {
             .zip(ref_vec.iter())
             .map(|(a, b)| (a - b).abs())
             .fold(0f32, f32::max);
+        // Inputs are identical f16-rounded values on both sides, so only f32
+        // accumulation-order differences remain.
         assert!(
-            max_diff < 1e-4,
+            max_diff < 1e-3,
             "mismatch (n_heads={n_heads}, n_kv={n_kv_heads}, d={head_dim}, \
              q_len={q_len}, pos0={pos0}): max_abs_diff={max_diff}"
         );
@@ -1262,7 +1501,9 @@ mod tests {
         // p in [n_sink + evict, used) with used = p + 1.
         for &(p, evict, n_sink) in &[(40usize, 7usize, 2usize), (12, 4, 0), (63, 1, 3)] {
             let used = p + 1;
-            let mut k_buf = vec![0f32; n_kv_heads * head_stride];
+            // The cache is f16, so the stored keys and the re-rotation arithmetic
+            // round through half precision.
+            let mut k_buf = vec![f16::ZERO; n_kv_heads * head_stride];
             let mut raws = Vec::new();
             for h in 0..n_kv_heads {
                 // Distinct raw key per head.
@@ -1271,7 +1512,9 @@ mod tests {
                     .collect();
                 let stored = rotate_at(&raw, p); // as written into the cache
                 let dst = h * head_stride + p * head_dim;
-                k_buf[dst..dst + head_dim].copy_from_slice(&stored);
+                for d in 0..head_dim {
+                    k_buf[dst + d] = f16::from_f32(stored[d]);
+                }
                 raws.push(raw);
             }
 
@@ -1288,9 +1531,10 @@ mod tests {
                 let max_diff = got
                     .iter()
                     .zip(&expected)
-                    .map(|(a, b)| (a - b).abs())
+                    .map(|(a, b)| (a.to_f32() - b).abs())
                     .fold(0f32, f32::max);
-                assert!(max_diff < 1e-5, "p={p} evict={evict} h={h}: max_diff={max_diff}");
+                // f16 storage of keys up to ~7 in magnitude bounds the error.
+                assert!(max_diff < 1.5e-2, "p={p} evict={evict} h={h}: max_diff={max_diff}");
             }
         }
     }
@@ -1305,13 +1549,15 @@ mod tests {
         let head_stride = max_seq * head_dim;
         let (used, n_sink, evict) = (10usize, 2usize, 3usize);
 
-        // Tag each (head, slot) row with a unique value head*100 + slot.
-        let mut v = vec![0f32; n_kv_heads * head_stride];
+        // Tag each (head, slot) row with a unique value head*100 + slot. These
+        // are small integers (<= 109 here), represented exactly in f16, so the
+        // shift is checked by exact equality despite the half-precision buffer.
+        let mut v = vec![f16::ZERO; n_kv_heads * head_stride];
         for h in 0..n_kv_heads {
             for slot in 0..used {
                 let off = h * head_stride + slot * head_dim;
                 for d in 0..head_dim {
-                    v[off + d] = (h * 100 + slot) as f32;
+                    v[off + d] = f16::from_f32((h * 100 + slot) as f32);
                 }
             }
         }
@@ -1322,12 +1568,12 @@ mod tests {
             // Sinks untouched.
             for slot in 0..n_sink {
                 let off = h * head_stride + slot * head_dim;
-                assert_eq!(v[off], (h * 100 + slot) as f32);
+                assert_eq!(v[off], f16::from_f32((h * 100 + slot) as f32));
             }
             // Survivors shifted down: new slot `s` holds old slot `s + evict`.
             for s in n_sink..(used - evict) {
                 let off = h * head_stride + s * head_dim;
-                assert_eq!(v[off], (h * 100 + s + evict) as f32, "h={h} s={s}");
+                assert_eq!(v[off], f16::from_f32((h * 100 + s + evict) as f32), "h={h} s={s}");
             }
         }
     }

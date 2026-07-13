@@ -12,6 +12,9 @@ path = "src/lib.rs"
 
 [dependencies]
 candle-core = "0.10.2"
+# f16 KV cache: K/V are stored half-precision to halve attention read bandwidth
+# and cache RAM. Same `half::f16` candle uses, so the types interoperate.
+half = "2"
 tokenizers = { version = "0.20", default-features = false, features = ["onig"] }
 anyhow = "1.0.102"
 axum = "0.7"

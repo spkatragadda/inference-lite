@@ -37,6 +37,9 @@ pub struct Engine {
 pub struct GenOutput {
     pub text: String,
     pub prompt_tokens: usize,
+    /// How many prompt tokens were served from the prefix cache (their K/V was
+    /// already computed by an earlier request); only the rest were prefilled.
+    pub reused_tokens: usize,
     pub generated_tokens: usize,
     pub prefill_secs: f64,
     pub decode_secs: f64,
@@ -66,9 +69,11 @@ impl Engine {
         &self.arch
     }
 
-    /// Greedy generation for a single prompt. Resets the KV cache, optionally
-    /// wraps the prompt in the Qwen3 ChatML template, runs one batched prefill,
-    /// then decodes up to `max_new_tokens` (stopping on EOS). `on_token` is
+    /// Greedy generation for a single prompt. Reuses the KV cache for any
+    /// prefix shared with the previous request (prefix caching — in a chat
+    /// session this skips re-prefilling the transcript), optionally wraps the
+    /// prompt in the ChatML template, prefills the remaining suffix in one
+    /// batch, then decodes up to `max_new_tokens` (stopping on EOS). `on_token` is
     /// invoked with each newly-decoded UTF-8-safe text delta so callers can
     /// stream; pass `|_| {}` to ignore. The full text is also returned.
     pub fn generate(
@@ -97,12 +102,17 @@ impl Engine {
             anyhow::bail!("prompt produced no tokens");
         }
 
-        // Fresh KV cache / position for this request.
-        self.transformer.reset_state();
+        // Prefix-cache reuse: in a chat session each turn's prompt extends the
+        // previous transcript, so the K/V for the shared prefix is already in
+        // the cache. Roll back to the longest common prefix and prefill only
+        // the new suffix (at least the final token, so logits exist to sample
+        // from). Falls back to a full prefill on the first request or after
+        // StreamingLLM eviction has compacted the cache.
+        let reused_tokens = self.transformer.reuse_prefix(&prompt_ids);
 
-        // Batched prefill: whole prompt in one pass, logits for the last token.
+        // Batched prefill of the (remaining) prompt, logits for the last token.
         let prefill_start = Instant::now();
-        let mut logits = self.transformer.forward_chunk(&prompt_ids)?;
+        let mut logits = self.transformer.forward_chunk(&prompt_ids[reused_tokens..])?;
         let prefill_secs = prefill_start.elapsed().as_secs_f64();
 
         // Greedy decode loop.
@@ -164,6 +174,7 @@ impl Engine {
         Ok(GenOutput {
             text,
             prompt_tokens: prompt_ids.len(),
+            reused_tokens,
             generated_tokens: generated.len(),
             prefill_secs,
             decode_secs,
